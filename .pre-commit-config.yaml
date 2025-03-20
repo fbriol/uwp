@@ -1,0 +1,63 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-case-conflict
+      - id: check-docstring-first
+      - id: check-yaml
+        exclude: "(conda/meta.yaml|.clang\\-format)$"
+      - id: debug-statements
+      - id: end-of-file-fixer
+        exclude: (dataset.*.txt)
+      - id: mixed-line-ending
+        args: [--fix=lf]
+        exclude: (docs.make.bat)
+      - id: trailing-whitespace
+  - repo: https://github.com/asottile/pyupgrade
+    rev: "v3.19.1"
+    hooks:
+    - id: pyupgrade
+      args: [--py312-plus]
+  - repo: https://github.com/PyCQA/flake8
+    rev: 7.1.1
+    hooks:
+      - id: flake8
+        exclude: tests
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.6
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+  # - repo: https://github.com/myint/docformatter
+  #   rev: "v1.7.5"
+  #   hooks:
+  #   - id: docformatter
+  #     exclude: (tests.data)
+  - repo: https://github.com/cheshirekow/cmake-format-precommit
+    rev: "v0.6.13"
+    hooks:
+    - id: cmake-lint
+    - id: cmake-format
+      additional_dependencies: [pyyaml]
+      types: [file]
+      files: CMakeLists.txt
+  - repo: https://github.com/codespell-project/codespell
+    rev: "v2.4.1"
+    hooks:
+    - id: codespell
+      exclude: "(.*plantuml|tests.data)"
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v19.1.7
+    hooks:
+      - id: clang-format
+        exclude: "(.*json)"
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.15.0
+    hooks:
+      - id: mypy
+        exclude: "docs|typings"
+        additional_dependencies:
+          # Type stubs
+          - types-setuptools
+          # Typed libraries
