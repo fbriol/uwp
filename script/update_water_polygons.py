@@ -378,7 +378,7 @@ def main():
 
     water_shapefiles = [
         str(shp_sub_region(region, sub_region))
-        for region, sub_region in args.areas.items()
+        for region, sub_region in AREAS.items()
         if shp_sub_region(region, sub_region).exists()
     ]
     subprocess.run(
