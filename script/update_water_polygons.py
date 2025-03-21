@@ -45,7 +45,7 @@ AREAS = {
     'poland': 'europe',
     'portugal': 'europe',
     'romania': 'europe',
-    'russia': 'europe',
+    'russia': '',
     'slovenia': 'europe',
     'spain': 'europe',
     'sweden': 'europe',
