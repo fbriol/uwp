@@ -354,7 +354,9 @@ def main():
     # Create the data directory if it doesn't exist
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     # Download and convert water polygons for all sub-regions
-    for region, sub_region in args.areas.items():
+    for region, sub_region in AREAS.items():
+        if region not in args.areas:
+            continue
         download_sub_region(region, sub_region)
         convert_to_shp(region)
     # Download the water polygons
