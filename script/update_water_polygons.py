@@ -19,7 +19,7 @@ AREAS = {
     'albania': 'europe',
     'azores': 'europe',
     'belgium': 'europe',
-    'bosnia-herzegovina': 'europe',
+    # 'bosnia-herzegovina': 'europe',
     'bulgaria': 'europe',
     'croatia': 'europe',
     'cyprus': 'europe',
@@ -30,7 +30,7 @@ AREAS = {
     'france': 'europe',
     'germany': 'europe',
     'greece': 'europe',
-    'guernsey-jersey': 'europe',
+    # 'guernsey-jersey': 'europe',
     'iceland': 'europe',
     'ireland-and-northern-ireland': 'europe',
     'isle-of-man': 'europe',
@@ -38,7 +38,7 @@ AREAS = {
     'latvia': 'europe',
     'lithuania': 'europe',
     'malta': 'europe',
-    'monaco': 'europe',
+    # 'monaco': 'europe',
     'montenegro': 'europe',
     'netherlands': 'europe',
     'norway': 'europe',
@@ -52,7 +52,7 @@ AREAS = {
     'turkey': 'europe',
     'ukraine': 'europe',
     'united-kingdom': 'europe',
-    'alberta': 'north-america/canada',
+    # 'alberta': 'north-america/canada',
     'british-columbia': 'north-america/canada',
     'manitoba': 'north-america/canada',
     'new-brunswick': 'north-america/canada',
@@ -63,61 +63,61 @@ AREAS = {
     'ontario': 'north-america/canada',
     'prince-edward-island': 'north-america/canada',
     'quebec': 'north-america/canada',
-    'saskatchewan': 'north-america/canada',
+    # 'saskatchewan': 'north-america/canada',
     'yukon': 'north-america/canada',
     'alabama': 'north-america/us',
     'alaska': 'north-america/us',
-    'arizona': 'north-america/us',
-    'arkansas': 'north-america/us',
+    # 'arizona': 'north-america/us',
+    # 'arkansas': 'north-america/us',
     'california': 'north-america/us',
-    'colorado': 'north-america/us',
+    # 'colorado': 'north-america/us',
     'connecticut': 'north-america/us',
     'delaware': 'north-america/us',
-    'district-of-columbia': 'north-america/us',
+    # 'district-of-columbia': 'north-america/us',
     'florida': 'north-america/us',
     'georgia': 'north-america/us',
     'hawaii': 'north-america/us',
-    'idaho': 'north-america/us',
-    'illinois': 'north-america/us',
-    'indiana': 'north-america/us',
-    'iowa': 'north-america/us',
-    'kansas': 'north-america/us',
-    'kentucky': 'north-america/us',
+    # 'idaho': 'north-america/us',
+    # 'illinois': 'north-america/us',
+    # 'indiana': 'north-america/us',
+    # 'iowa': 'north-america/us',
+    # 'kansas': 'north-america/us',
+    # 'kentucky': 'north-america/us',
     'louisiana': 'north-america/us',
     'maine': 'north-america/us',
     'maryland': 'north-america/us',
     'massachusetts': 'north-america/us',
-    'michigan': 'north-america/us',
-    'minnesota': 'north-america/us',
+    # 'michigan': 'north-america/us',
+    # 'minnesota': 'north-america/us',
     'mississippi': 'north-america/us',
-    'missouri': 'north-america/us',
-    'montana': 'north-america/us',
-    'nebraska': 'north-america/us',
-    'nevada': 'north-america/us',
+    # 'missouri': 'north-america/us',
+    # 'montana': 'north-america/us',
+    # 'nebraska': 'north-america/us',
+    # 'nevada': 'north-america/us',
     'new-hampshire': 'north-america/us',
     'new-jersey': 'north-america/us',
-    'new-mexico': 'north-america/us',
+    # 'new-mexico': 'north-america/us',
     'new-york': 'north-america/us',
     'north-carolina': 'north-america/us',
-    'north-dakota': 'north-america/us',
-    'ohio': 'north-america/us',
-    'oklahoma': 'north-america/us',
+    # 'north-dakota': 'north-america/us',
+    # 'ohio': 'north-america/us',
+    # 'oklahoma': 'north-america/us',
     'oregon': 'north-america/us',
     'pennsylvania': 'north-america/us',
     'puerto-rico': 'north-america/us',
     'rhode-island': 'north-america/us',
     'south-carolina': 'north-america/us',
-    'south-dakota': 'north-america/us',
-    'tennessee': 'north-america/us',
+    # 'south-dakota': 'north-america/us',
+    # 'tennessee': 'north-america/us',
     'texas': 'north-america/us',
-    'us-virgin-islands': 'north-america/us',
-    'utah': 'north-america/us',
-    'vermont': 'north-america/us',
+    # 'us-virgin-islands': 'north-america/us',
+    # 'utah': 'north-america/us',
+    # 'vermont': 'north-america/us',
     'virginia': 'north-america/us',
     'washington': 'north-america/us',
-    'west-virginia': 'north-america/us',
-    'wisconsin': 'north-america/us',
-    'wyoming': 'north-america/us',
+    # 'west-virginia': 'north-america/us',
+    # 'wisconsin': 'north-america/us',
+    # 'wyoming': 'north-america/us',
     'greenland': 'north-america',
     'mexico': 'north-america',
     'africa': '',
@@ -139,6 +139,12 @@ ROOT = pathlib.Path(__file__).parent.parent
 
 #: This is the directory where the data are handled
 DATA_DIR = ROOT / 'data'
+
+#: Where the OSM data are downloaded
+OSM_DATA_DIR = DATA_DIR / 'osm-pbf'
+
+#: Where the water polygons are stored
+WATER_POLYGON_DIR = DATA_DIR / 'shapefiles'
 
 
 def download_file(url: str, output_file: str) -> None:
@@ -171,14 +177,18 @@ def download_file(url: str, output_file: str) -> None:
     LOGGER.info('Download complete: %s', output_file)
 
 
-def osm_pbf_sub_region(region: str) -> pathlib.Path:
+def osm_pbf_sub_region(region: str, sub_region: str) -> pathlib.Path:
     """Get the path to the DBF file for the specified region"""
-    return DATA_DIR / f'{region}.osm.pbf'
+    if sub_region:
+        return OSM_DATA_DIR / sub_region / f'{region}.osm.pbf'
+    return OSM_DATA_DIR / f'{region}.osm.pbf'
 
 
-def shp_sub_region(region: str) -> pathlib.Path:
+def shp_sub_region(region: str, sub_region: str) -> pathlib.Path:
     """Get the path to the SHP file for the specified region"""
-    return DATA_DIR / region / 'natural_water.shp'
+    if sub_region:
+        return WATER_POLYGON_DIR / sub_region / region / 'water.shp'
+    return WATER_POLYGON_DIR / region / 'water.shp'
 
 
 def water_polygon_path() -> pathlib.Path:
@@ -199,10 +209,11 @@ def download_sub_region(region: str, sub_region: str) -> None:
     else:
         # https://download.geofabrik.de/asia-latest.osm.pbf
         url = f'{GEOFABRIK_URL}/{region}-latest.osm.pbf'
-    output_file = osm_pbf_sub_region(region)
-    if output_file.exists() or shp_sub_region(region).exists():
+    output_file = osm_pbf_sub_region(region, sub_region)
+    if output_file.exists() or shp_sub_region(region, sub_region).exists():
         LOGGER.info('%s already exists, skipping download', output_file)
         return
+    output_file.parent.mkdir(parents=True, exist_ok=True)
     download_file(url, str(output_file))
 
 
@@ -251,9 +262,9 @@ def initialize_working_directory() -> pathlib.Path:
     return corrected_shp
 
 
-def convert_to_shp(region: str) -> None:
+def convert_to_shp(region: str, sub_region: str) -> None:
     """Convert the OSM PBF file to SHP format"""
-    water_shp = shp_sub_region(region)
+    water_shp = shp_sub_region(region, sub_region)
     if water_shp.exists():
         LOGGER.info(
             'Shapefile for %s already exists, skipping conversion',
@@ -261,7 +272,7 @@ def convert_to_shp(region: str) -> None:
         )
         return
     water_shp.parent.mkdir(parents=True, exist_ok=True)
-    osm_pbf = osm_pbf_sub_region(region)
+    osm_pbf = osm_pbf_sub_region(region, sub_region)
     water_pbf = osm_pbf.parent / f'{region}-water.osm.pbf'
 
     subprocess.run(
@@ -275,6 +286,7 @@ def convert_to_shp(region: str) -> None:
             'natural=waterway',
             '-o',
             str(water_pbf),
+            '--overwrite',
         ],
         check=True,
     )
@@ -358,19 +370,25 @@ def main():
         if region not in args.areas:
             continue
         download_sub_region(region, sub_region)
-        convert_to_shp(region)
+        convert_to_shp(region, sub_region)
     # Download the water polygons
     download_water_polygons()
 
     target = initialize_working_directory()
 
     water_shapefiles = [
-        str(shp_sub_region(region))
-        for region in args.areas
-        if shp_sub_region(region).exists()
+        str(shp_sub_region(region, sub_region))
+        for region, sub_region in args.areas.items()
+        if shp_sub_region(region, sub_region).exists()
     ]
     subprocess.run(
-        [args.uwp, str(target), '-o', str(target), *water_shapefiles],
+        [
+            args.uwp,
+            str(target),
+            '-o',
+            str(target),
+            *water_shapefiles,
+        ],
         check=True,
     )
 
