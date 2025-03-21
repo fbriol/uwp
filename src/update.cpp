@@ -1,17 +1,21 @@
+
 #include "uwp/update.hpp"
 
+#include <mutex>
+
+#include "uwp/mutex_protected_set.hpp"
 #include "uwp/parallel_for.hpp"
 
 namespace uwp {
 
-auto select_overlap(Shapefile::PolygonList &water, const Shapefile &area_shp)
+inline auto select_overlap(
+    Shapefile::PolygonList &water, const Shapefile &area_shp, const size_t i0,
+    const size_t i1, MutexProtectedSet<const Polygon *> &filtered_polygons)
     -> std::vector<std::pair<size_t, std::vector<Polygon>>> {
-  auto filtered_polygons = std::set<const Polygon *>();
   auto result = std::vector<std::pair<size_t, std::vector<Polygon>>>();
+  result.reserve(i1 - i0);
 
-  result.reserve(water.size());
-
-  for (size_t ix = 0; ix < water.size(); ++ix) {
+  for (size_t ix = i0; ix < i1; ++ix) {
     const auto &water_polygon = *water[ix];
 
     // Compute the envelope of the water polygon.
@@ -21,7 +25,6 @@ auto select_overlap(Shapefile::PolygonList &water, const Shapefile &area_shp)
     std::vector<Shapefile::PolygonIndex> area_polygons;
     area_shp.rtree()->query(bg::index::intersects(envelope),
                             std::back_inserter(area_polygons));
-
     // If there are no area polygons that intersect the envelope, skip to the
     // next water polygon.
     if (area_polygons.empty()) {
@@ -40,15 +43,36 @@ auto select_overlap(Shapefile::PolygonList &water, const Shapefile &area_shp)
           bg::within(*item.second, water_polygon)) {
         continue;
       }
-      filtered_polygons.insert(item.second);
-      matching_areas.emplace_back(*item.second);
-    }
 
+      if (filtered_polygons.insert(item.second).second) {
+        // Add the area polygon to the selection list.
+        matching_areas.emplace_back(*item.second);
+      }
+    }
     if (!matching_areas.empty()) {
       std::cout << "#" << ix << " " << matching_areas.size() << std::endl;
       result.emplace_back(std::make_pair(ix, std::move(matching_areas)));
     }
   }
+  return result;
+}
+
+auto select_overlap(Shapefile::PolygonList &water, const Shapefile &area_shp)
+    -> std::vector<std::pair<size_t, std::vector<Polygon>>> {
+  auto filtered_polygons = MutexProtectedSet<const Polygon *>();
+  auto result = std::vector<std::pair<size_t, std::vector<Polygon>>>();
+  auto mutex = std::mutex();
+  auto worker = [&area_shp, &filtered_polygons, &result, &mutex, &water](
+                    const size_t i0, const size_t i1) {
+    auto selected_overlapping_polygons =
+        select_overlap(water, area_shp, i0, i1, filtered_polygons);
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      result.insert(result.end(), selected_overlapping_polygons.begin(),
+                    selected_overlapping_polygons.end());
+    }
+  };
+  parallel_for(worker, water.size(), 128);
   return result;
 }
 
