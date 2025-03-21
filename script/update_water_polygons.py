@@ -52,10 +52,74 @@ AREAS = {
     'turkey': 'europe',
     'ukraine': 'europe',
     'united-kingdom': 'europe',
-    'canada': 'north-america',
+    'alberta': 'north-america/canada',
+    'british-columbia': 'north-america/canada',
+    'manitoba': 'north-america/canada',
+    'new-brunswick': 'north-america/canada',
+    'newfoundland-and-labrador': 'north-america/canada',
+    'northwest-territories': 'north-america/canada',
+    'nova-scotia': 'north-america/canada',
+    'nunavut': 'north-america/canada',
+    'ontario': 'north-america/canada',
+    'prince-edward-island': 'north-america/canada',
+    'quebec': 'north-america/canada',
+    'saskatchewan': 'north-america/canada',
+    'yukon': 'north-america/canada',
+    'alabama': 'north-america/us',
+    'alaska': 'north-america/us',
+    'arizona': 'north-america/us',
+    'arkansas': 'north-america/us',
+    'california': 'north-america/us',
+    'colorado': 'north-america/us',
+    'connecticut': 'north-america/us',
+    'delaware': 'north-america/us',
+    'district-of-columbia': 'north-america/us',
+    'florida': 'north-america/us',
+    'georgia': 'north-america/us',
+    'hawaii': 'north-america/us',
+    'idaho': 'north-america/us',
+    'illinois': 'north-america/us',
+    'indiana': 'north-america/us',
+    'iowa': 'north-america/us',
+    'kansas': 'north-america/us',
+    'kentucky': 'north-america/us',
+    'louisiana': 'north-america/us',
+    'maine': 'north-america/us',
+    'maryland': 'north-america/us',
+    'massachusetts': 'north-america/us',
+    'michigan': 'north-america/us',
+    'minnesota': 'north-america/us',
+    'mississippi': 'north-america/us',
+    'missouri': 'north-america/us',
+    'montana': 'north-america/us',
+    'nebraska': 'north-america/us',
+    'nevada': 'north-america/us',
+    'new-hampshire': 'north-america/us',
+    'new-jersey': 'north-america/us',
+    'new-mexico': 'north-america/us',
+    'new-york': 'north-america/us',
+    'north-carolina': 'north-america/us',
+    'north-dakota': 'north-america/us',
+    'ohio': 'north-america/us',
+    'oklahoma': 'north-america/us',
+    'oregon': 'north-america/us',
+    'pennsylvania': 'north-america/us',
+    'puerto-rico': 'north-america/us',
+    'rhode-island': 'north-america/us',
+    'south-carolina': 'north-america/us',
+    'south-dakota': 'north-america/us',
+    'tennessee': 'north-america/us',
+    'texas': 'north-america/us',
+    'us-virgin-islands': 'north-america/us',
+    'utah': 'north-america/us',
+    'vermont': 'north-america/us',
+    'virginia': 'north-america/us',
+    'washington': 'north-america/us',
+    'west-virginia': 'north-america/us',
+    'wisconsin': 'north-america/us',
+    'wyoming': 'north-america/us',
     'greenland': 'north-america',
     'mexico': 'north-america',
-    'north-america': 'north-america',
     'africa': '',
     'antarctica': '',
     'asia': '',
@@ -176,16 +240,15 @@ def move_shp(src: pathlib.Path, dst: pathlib.Path) -> None:
         shutil.move(shx, dst.with_suffix('.shx'))
 
 
-def iniailize_working_directory() -> tuple[pathlib.Path, pathlib.Path]:
+def initialize_working_directory() -> pathlib.Path:
     """Initialize the working directory"""
     corrected_shp = corrected_water_polygon_path()
     if corrected_shp.exists():
         corrected_shp.unlink()
-    tmpfile = tmp_polygon_path()
     water_polygon = water_polygon_shp()
     copy_shp(water_polygon, corrected_shp)
 
-    return corrected_shp, tmpfile
+    return corrected_shp
 
 
 def convert_to_shp(region: str) -> None:
@@ -296,20 +359,17 @@ def main():
     # Download the water polygons
     download_water_polygons()
 
-    target, tmpfile = iniailize_working_directory()
+    target = initialize_working_directory()
 
-    for item in args.areas:
-        LOGGER.info('Processing %s', item)
-        subprocess.run(
-            [
-                args.uwp,
-                str(target),
-                str(shp_sub_region(item)),
-                str(tmpfile),
-            ],
-            check=True,
-        )
-        move_shp(tmpfile, target)
+    water_shapefiles = [
+        str(shp_sub_region(region))
+        for region in args.areas
+        if shp_sub_region(region).exists()
+    ]
+    subprocess.run(
+        [args.uwp, str(target), '-o', str(target), *water_shapefiles],
+        check=True,
+    )
 
 
 if __name__ == '__main__':
