@@ -121,14 +121,12 @@ auto cascade_union(const std::vector<Polygon> &polygons)
 }
 
 auto merge_overlapping(
-    Shapefile::PolygonList &water_polygons,
     const std::vector<std::pair<size_t, std::vector<Polygon>>> &overlap,
     const size_t i0, const size_t i1)
     -> std::vector<std::pair<size_t, std::vector<Polygon>>> {
   auto result = std::vector<std::pair<size_t, std::vector<Polygon>>>();
   for (size_t ix = i0; ix < i1; ++ix) {
     const auto &item = overlap[ix];
-    auto &water_polygon = water_polygons[item.first];
     auto unioned = cascade_union(item.second);
     if (unioned.empty()) {
       continue;
@@ -149,7 +147,7 @@ auto merge_overlapping(
 
   auto worker = [&extra_polygons, &mutex, &overlap, &water_polygons](
                     const size_t i0, const size_t i1) {
-    auto unioned_polygons = merge_overlapping(water_polygons, overlap, i0, i1);
+    auto unioned_polygons = merge_overlapping(overlap, i0, i1);
     {
       std::lock_guard<std::mutex> lock(mutex);
       for (auto &&item : unioned_polygons) {
