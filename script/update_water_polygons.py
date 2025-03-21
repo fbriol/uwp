@@ -319,10 +319,11 @@ def usage() -> argparse.Namespace:
         'estuaries and missing polygons.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    choices = tuple(AREAS)
     parser.add_argument(
         '--areas',
-        choices=AREAS,
-        default=AREAS,
+        choices=choices,
+        default=choices,
         nargs='+',
         help='Areas to process. Defaults to all areas.',
     )
