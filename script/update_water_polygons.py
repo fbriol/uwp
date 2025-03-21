@@ -350,7 +350,15 @@ def usage() -> argparse.Namespace:
 
 def main():
     """Main function to download and convert water polygons"""
+    logging.basicConfig(
+        level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+
     args = usage()
+
+    if not shutil.which('osmium'):
+        LOGGER.error('osmium is not installed. Please install osmium.')
+        sys.exit(1)
 
     if not shutil.which('ogr2ogr'):
         LOGGER.error('ogr2ogr is not installed. Please install GDAL.')
@@ -359,9 +367,6 @@ def main():
     if not shutil.which(args.uwp):
         LOGGER.error('%s does not exist. Please check the path.', args.uwp)
 
-    logging.basicConfig(
-        level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s'
-    )
     LOGGER.info('Starting water polygon update')
     # Create the data directory if it doesn't exist
     DATA_DIR.mkdir(parents=True, exist_ok=True)
