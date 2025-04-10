@@ -316,13 +316,12 @@ def download_water_polygons() -> None:
         f'{OSM_URL}/download/water-polygons-split-4326.zip',
         str(output_file),
     )
+    folder = water_polygon_path().parent
     with zipfile.ZipFile(output_file, 'r') as zip_ref:
-        zip_ref.extractall(water_polygon_path())
-    LOGGER.info('Extracted water polygons to %s', water_polygon_path())
+        zip_ref.extractall(folder)
+    LOGGER.info('Extracted water polygons to %s', folder)
     # Clean up the zip file
     os.remove(output_file)
-    # Remove the temporary directory
-    shutil.rmtree(water_polygon_path(), ignore_errors=True)
 
 
 def usage() -> argparse.Namespace:
