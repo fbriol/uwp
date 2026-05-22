@@ -276,6 +276,9 @@ def convert_to_shp(region: str, sub_region: str) -> None:
     osm_pbf = osm_pbf_sub_region(region, sub_region)
     water_pbf = osm_pbf.parent / f'{region}-water.osm.pbf'
 
+    ogr_env = os.environ.copy()
+    ogr_env['OGR_GEOMETRY_ACCEPT_UNCLOSED_RING'] = 'NO'
+
     subprocess.run(
         [
             'osmium',
@@ -300,7 +303,7 @@ def convert_to_shp(region: str, sub_region: str) -> None:
             str(water_pbf),
             'multipolygons',
         ],
-        env={'OGR_GEOMETRY_ACCEPT_UNCLOSED_RING': 'NO'},
+        env=ogr_env,
         check=True,
     )
 
