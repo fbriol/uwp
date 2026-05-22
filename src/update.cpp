@@ -78,7 +78,9 @@ auto select_overlap(const Shapefile &water_shp,
     pairs.insert(pairs.end(), std::make_move_iterator(local.begin()),
                  std::make_move_iterator(local.end()));
   };
-  parallel_for(worker, area.size(), 128);
+  // num_threads = 0 → use std::thread::hardware_concurrency(); chunk size is
+  // chosen dynamically inside parallel_for to balance load across threads.
+  parallel_for(worker, area.size(), 0);
 
   // Group matches by water polygon index. Each water index appears at most
   // once in the result so the merge phase can mutate water polygons without
