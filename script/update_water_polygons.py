@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import concurrent.futures
 import os
 import pathlib
 import subprocess
@@ -344,6 +345,15 @@ def usage() -> argparse.Namespace:
         default=str(ROOT / 'build' / 'uwp'),
         help='Path to the UWP executable.',
     )
+    parser.add_argument(
+        '--jobs',
+        type=int,
+        default=4,
+        help='Number of regions to download and convert in parallel. '
+        'Each job spawns at most one download and one osmium/ogr2ogr '
+        'subprocess at a time. Use 1 to restore the original sequential '
+        'behaviour.',
+    )
     return parser.parse_args()
 
 
@@ -369,12 +379,49 @@ def main():
     LOGGER.info('Starting water polygon update')
     # Create the data directory if it doesn't exist
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    # Download and convert water polygons for all sub-regions
-    for region, sub_region in AREAS.items():
-        if region not in args.areas:
-            continue
+
+    # Download and convert water polygons for all sub-regions. Regions are
+    # independent (different URLs, different output directories) so they can
+    # be processed in parallel. Within a region, download must finish before
+    # the osmium/ogr2ogr conversion — that ordering is preserved by running
+    # both steps inside the same worker function.
+    regions_to_process = [
+        (region, sub_region)
+        for region, sub_region in AREAS.items()
+        if region in args.areas
+    ]
+
+    def process_region(region: str, sub_region: str) -> None:
         download_sub_region(region, sub_region)
         convert_to_shp(region, sub_region)
+
+    jobs = max(1, args.jobs)
+    if jobs == 1 or len(regions_to_process) <= 1:
+        for region, sub_region in regions_to_process:
+            process_region(region, sub_region)
+    else:
+        # Threads (not processes): the work is dominated by subprocess.run and
+        # urllib I/O, both of which release the GIL. Using threads also keeps
+        # logging coherent in a single interpreter.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = {
+                pool.submit(process_region, region, sub_region): region
+                for region, sub_region in regions_to_process
+            }
+            # Iterate as futures complete so failures surface immediately and
+            # the remaining work can be cancelled.
+            for future in concurrent.futures.as_completed(futures):
+                region = futures[future]
+                try:
+                    future.result()
+                except Exception:
+                    LOGGER.exception('Failed processing region %s', region)
+                    # Cancel any not-yet-started jobs; in-flight ones cannot
+                    # be interrupted but their results will be discarded.
+                    for pending in futures:
+                        pending.cancel()
+                    raise
+
     # Download the water polygons
     download_water_polygons()
 
