@@ -2,77 +2,99 @@
 #include "uwp/update.hpp"
 
 #include <mutex>
+#include <unordered_map>
 
-#include "uwp/mutex_protected_set.hpp"
 #include "uwp/parallel_for.hpp"
 
 namespace uwp {
 
-inline auto select_overlap(
-    Shapefile::PolygonList &water, const Shapefile &area_shp, const size_t i0,
-    const size_t i1, MutexProtectedSet<const Polygon *> &filtered_polygons)
-    -> std::vector<std::pair<size_t, std::vector<Polygon>>> {
-  auto result = std::vector<std::pair<size_t, std::vector<Polygon>>>();
+// Inverted-loop helper: for each area polygon in [i0, i1), query the water
+// R-tree for candidate water polygons and record the first valid match.
+//
+// "First valid match" means: a water polygon `w` such that
+//   bg::intersects(w, area)  AND  NOT bg::within(area, w)
+// (i.e. they overlap, and the area is not entirely contained in `w` — in the
+// latter case the area is already covered and merging is unnecessary).
+//
+// Assigning each area polygon to at most one water polygon preserves the
+// invariant the merge phase relies on: each water index appears in the
+// returned grouping at most once, so the merge can mutate water polygons
+// without cross-thread synchronization.
+inline auto select_overlap_local(const Shapefile &water_shp,
+                                 const Shapefile::PolygonList &area,
+                                 const size_t i0, const size_t i1)
+    -> std::vector<std::pair<size_t, Polygon>> {
+  auto result = std::vector<std::pair<size_t, Polygon>>();
   result.reserve(i1 - i0);
 
+  const auto &water_polygons = *water_shp.polygons();
+  const auto &water_rtree = *water_shp.rtree();
+
+  std::vector<Shapefile::PolygonIndex> water_candidates;
   for (size_t ix = i0; ix < i1; ++ix) {
-    const auto &water_polygon = *water[ix];
+    const auto &area_polygon = *area[ix];
 
-    // Compute the envelope of the water polygon.
-    auto envelope = bg::return_envelope<Box>(water_polygon);
+    // Envelope of the area polygon.
+    auto envelope = bg::return_envelope<Box>(area_polygon);
 
-    // Query the RTree index for the area polygons that intersect the envelope.
-    std::vector<Shapefile::PolygonIndex> area_polygons;
-    area_shp.rtree()->query(bg::index::intersects(envelope),
-                            std::back_inserter(area_polygons));
-    // If there are no area polygons that intersect the envelope, skip to the
-    // next water polygon.
-    if (area_polygons.empty()) {
+    // Query the water R-tree for candidate water polygons.
+    water_candidates.clear();
+    water_rtree.query(bg::index::intersects(envelope),
+                      std::back_inserter(water_candidates));
+    if (water_candidates.empty()) {
       continue;
     }
 
-    auto matching_areas = std::vector<Polygon>();
-    for (auto &&item : area_polygons) {
-      // Ensure the current area polygon isn't already included in the selection
-      // list.
-      if (filtered_polygons.contains(item.second)) {
+    for (const auto &candidate : water_candidates) {
+      const auto water_idx = candidate.second;
+      const auto &water_polygon = *water_polygons[water_idx];
+
+      if (!bg::intersects(water_polygon, area_polygon) ||
+          bg::within(area_polygon, water_polygon)) {
         continue;
       }
 
-      if (!bg::intersects(water_polygon, *item.second) ||
-          bg::within(*item.second, water_polygon)) {
-        continue;
-      }
-
-      if (filtered_polygons.insert(item.second).second) {
-        // Add the area polygon to the selection list.
-        matching_areas.emplace_back(*item.second);
-      }
-    }
-    if (!matching_areas.empty()) {
-      std::cout << "#" << ix << " " << matching_areas.size() << std::endl;
-      result.emplace_back(ix, std::move(matching_areas));
+      // Exclusive assignment: this area polygon belongs to `water_idx` only.
+      result.emplace_back(water_idx, area_polygon);
+      break;
     }
   }
   return result;
 }
 
-auto select_overlap(Shapefile::PolygonList &water, const Shapefile &area_shp)
+auto select_overlap(const Shapefile &water_shp,
+                    const Shapefile::PolygonList &area)
     -> std::vector<std::pair<size_t, std::vector<Polygon>>> {
-  auto filtered_polygons = MutexProtectedSet<const Polygon *>();
-  auto result = std::vector<std::pair<size_t, std::vector<Polygon>>>();
+  auto pairs = std::vector<std::pair<size_t, Polygon>>();
   auto mutex = std::mutex();
-  auto worker = [&area_shp, &filtered_polygons, &result, &mutex, &water](
-                    const size_t i0, const size_t i1) {
-    auto selected_overlapping_polygons =
-        select_overlap(water, area_shp, i0, i1, filtered_polygons);
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      result.insert(result.end(), selected_overlapping_polygons.begin(),
-                    selected_overlapping_polygons.end());
+
+  auto worker = [&water_shp, &area, &pairs, &mutex](const size_t i0,
+                                                    const size_t i1) {
+    auto local = select_overlap_local(water_shp, area, i0, i1);
+    if (local.empty()) {
+      return;
     }
+    std::lock_guard<std::mutex> lock(mutex);
+    pairs.insert(pairs.end(), std::make_move_iterator(local.begin()),
+                 std::make_move_iterator(local.end()));
   };
-  parallel_for(worker, water.size(), 128);
+  parallel_for(worker, area.size(), 128);
+
+  // Group matches by water polygon index. Each water index appears at most
+  // once in the result so the merge phase can mutate water polygons without
+  // synchronization.
+  std::unordered_map<size_t, std::vector<Polygon>> grouped;
+  grouped.reserve(pairs.size());
+  for (auto &&p : pairs) {
+    grouped[p.first].emplace_back(std::move(p.second));
+  }
+
+  auto result = std::vector<std::pair<size_t, std::vector<Polygon>>>();
+  result.reserve(grouped.size());
+  for (auto &&kv : grouped) {
+    std::cout << "#" << kv.first << " " << kv.second.size() << std::endl;
+    result.emplace_back(kv.first, std::move(kv.second));
+  }
   return result;
 }
 

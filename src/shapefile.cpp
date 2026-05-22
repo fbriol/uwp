@@ -2,17 +2,20 @@
 
 #include <shapefil.h>
 
+#include <memory>
+
 namespace uwp {
 
 auto Shapefile::build_rtree_index() -> void {
   std::vector<PolygonIndex> ptr;
   ptr.reserve(polygons_->size());
-  std::transform(polygons_->begin(), polygons_->end(), std::back_inserter(ptr),
-                 [](std::unique_ptr<Polygon> &p) {
-                   return std::make_pair(
-                       boost::geometry::return_envelope<Box>(*p), p.get());
-                 });
-  rtree_.reset(new RTree(ptr));
+  for (size_t ix = 0; ix < polygons_->size(); ++ix) {
+    ptr.emplace_back(boost::geometry::return_envelope<Box>(*(*polygons_)[ix]),
+                     ix);
+  }
+  // Bulk-load via the packing constructor — produces a better-balanced tree
+  // and is significantly faster than per-element insertion for static data.
+  rtree_ = std::make_shared<RTree>(ptr);
 }
 
 // The SHPObjectPtr type is a unique_ptr for SHPObject with a custom

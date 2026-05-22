@@ -18,8 +18,12 @@ class Shapefile {
   /// @brief List of polygons in the shapefile.
   using PolygonList = std::vector<PolygonPtr>;
 
-  /// @brief Pair of a bounding box and a pointer to a polygon.
-  using PolygonIndex = std::pair<Box, const Polygon *>;
+  /// @brief Pair of a bounding box and the index of the polygon in the
+  /// shapefile's polygon list. Storing the index (rather than a pointer) lets
+  /// callers identify the matching polygon directly — useful when the loop is
+  /// driven by the *other* set and the matched polygon's identity must be
+  /// preserved across the merge phase.
+  using PolygonIndex = std::pair<Box, size_t>;
 
   /// @brief RTree index for the envelope of the polygons.
   using RTree =

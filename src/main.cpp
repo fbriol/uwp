@@ -50,14 +50,15 @@ int main(int argc, char* argv[]) {
   auto water_shp = uwp::Shapefile(water_file);
   water_shp.build_rtree_index();
 
-  // Process each region polygon
+  // Process each region polygon. The region set is much smaller than the
+  // water set, so we drive the loop by region polygons and query the water
+  // R-tree built above — no region R-tree is needed.
   for (const auto& region_file : region_files) {
     std::cout << "Processing region file: " << region_file << std::endl;
 
     auto area_shp = uwp::Shapefile(region_file);
-    area_shp.build_rtree_index();
 
-    auto overlap = uwp::select_overlap(*(water_shp.polygons()), area_shp);
+    auto overlap = uwp::select_overlap(water_shp, *(area_shp.polygons()));
     uwp::merge_overlapping(water_shp, overlap);
   }
 
