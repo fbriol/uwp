@@ -51,7 +51,7 @@ inline auto select_overlap(
     }
     if (!matching_areas.empty()) {
       std::cout << "#" << ix << " " << matching_areas.size() << std::endl;
-      result.emplace_back(std::make_pair(ix, std::move(matching_areas)));
+      result.emplace_back(ix, std::move(matching_areas));
     }
   }
   return result;
@@ -86,7 +86,7 @@ inline auto multi_polygon_union(const MultiPolygon &mpoly1,
 
 // Comparator based on area to prioritize merging smaller multipolygons first
 struct CompareArea {
-  bool operator()(const MultiPolygon &a, const MultiPolygon &b) const {
+  auto operator()(const MultiPolygon &a, const MultiPolygon &b) const -> bool {
     return bg::area(a) > bg::area(b);
   }
 };
@@ -131,7 +131,7 @@ auto merge_overlapping(
     if (unioned.empty()) {
       continue;
     }
-    result.emplace_back(std::make_pair(item.first, std::move(unioned)));
+    result.emplace_back(item.first, std::move(unioned));
   }
   return result;
 }
@@ -145,26 +145,36 @@ auto merge_overlapping(
 
   auto mutex = std::mutex();
 
+  // Note: each `item.first` (water polygon index) is unique across `overlap`
+  // (select_overlap produces at most one entry per index). Different threads
+  // therefore operate on disjoint water polygons, so the per-polygon union and
+  // assignment require no synchronization. Only the append into the shared
+  // `extra_polygons` vector needs to be protected. We accumulate into a
+  // thread-local vector and merge once at the end to keep contention near zero.
   auto worker = [&extra_polygons, &mutex, &overlap, &water_polygons](
                     const size_t i0, const size_t i1) {
     auto unioned_polygons = merge_overlapping(overlap, i0, i1);
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      for (auto &&item : unioned_polygons) {
-        auto &water_polygon = water_polygons[item.first];
-        // Merge the target polygon with the unioned polygons
-        std::vector<Polygon> unioned;
-        bg::union_(*water_polygon, item.second.front(), unioned);
-        if (!unioned.empty()) {
-          *water_polygon = std::move(unioned.front());
-          for (auto it = unioned.begin() + 1; it != unioned.end(); ++it) {
-            extra_polygons.emplace_back(std::move(*it));
-          }
-        }
-        for (auto it = item.second.begin() + 1; it != item.second.end(); ++it) {
-          extra_polygons.emplace_back(std::move(*it));
+    auto local_extra = std::vector<Polygon>();
+    for (auto &&item : unioned_polygons) {
+      auto &water_polygon = water_polygons[item.first];
+      // Merge the target polygon with the unioned polygons
+      std::vector<Polygon> unioned;
+      bg::union_(*water_polygon, item.second.front(), unioned);
+      if (!unioned.empty()) {
+        *water_polygon = std::move(unioned.front());
+        for (auto it = unioned.begin() + 1; it != unioned.end(); ++it) {
+          local_extra.emplace_back(std::move(*it));
         }
       }
+      for (auto it = item.second.begin() + 1; it != item.second.end(); ++it) {
+        local_extra.emplace_back(std::move(*it));
+      }
+    }
+    if (!local_extra.empty()) {
+      std::lock_guard<std::mutex> lock(mutex);
+      extra_polygons.insert(extra_polygons.end(),
+                            std::make_move_iterator(local_extra.begin()),
+                            std::make_move_iterator(local_extra.end()));
     }
   };
 
