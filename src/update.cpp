@@ -237,24 +237,38 @@ auto merge_overlapping(
 
 auto merge_overlapping(
     Shapefile &water_shp,
-    const std::vector<std::pair<size_t, std::vector<Polygon>>> &overlap)
-    -> void {
+    const std::vector<std::pair<size_t, std::vector<Polygon>>> &overlap,
+    Shapefile *patches_out) -> void {
   auto &water_polygons = *(water_shp.polygons());
   auto extra_polygons = std::vector<Polygon>();
+  auto patches = std::vector<Polygon>();  // accumulated only if requested
 
   auto mutex = std::mutex();
+  const bool collect_patches = (patches_out != nullptr);
 
   // Note: each `item.first` (water polygon index) is unique across `overlap`
   // (select_overlap produces at most one entry per index). Different threads
   // therefore operate on disjoint water polygons, so the per-polygon union and
   // assignment require no synchronization. Only the append into the shared
-  // `extra_polygons` vector needs to be protected. We accumulate into a
-  // thread-local vector and merge once at the end to keep contention near zero.
-  auto worker = [&extra_polygons, &mutex, &overlap, &water_polygons](
-                    const size_t i0, const size_t i1) {
+  // `extra_polygons` and `patches` vectors needs to be protected. We
+  // accumulate into thread-local vectors and merge once at the end to keep
+  // contention near zero.
+  auto worker = [&extra_polygons, &patches, collect_patches, &mutex, &overlap,
+                 &water_polygons](const size_t i0, const size_t i1) {
     auto unioned_polygons = merge_overlapping(overlap, i0, i1);
     auto local_extra = std::vector<Polygon>();
+    auto local_patches = std::vector<Polygon>();
     for (auto &&item : unioned_polygons) {
+      // Capture every piece of the cascade-unioned area polygons as a
+      // patch — this is the ground-truth "what we added" representation.
+      // Done BEFORE the in-place union with the water polygon, while the
+      // pieces are still distinct geometric entities.
+      if (collect_patches) {
+        for (const auto &piece : item.second) {
+          local_patches.emplace_back(piece);
+        }
+      }
+
       auto &water_polygon = water_polygons[item.first];
       // Merge the target polygon with the unioned polygons
       std::vector<Polygon> unioned;
@@ -269,17 +283,29 @@ auto merge_overlapping(
         local_extra.emplace_back(std::move(*it));
       }
     }
-    if (!local_extra.empty()) {
+    if (!local_extra.empty() || !local_patches.empty()) {
       std::lock_guard<std::mutex> lock(mutex);
-      extra_polygons.insert(extra_polygons.end(),
-                            std::make_move_iterator(local_extra.begin()),
-                            std::make_move_iterator(local_extra.end()));
+      if (!local_extra.empty()) {
+        extra_polygons.insert(extra_polygons.end(),
+                              std::make_move_iterator(local_extra.begin()),
+                              std::make_move_iterator(local_extra.end()));
+      }
+      if (!local_patches.empty()) {
+        patches.insert(patches.end(),
+                       std::make_move_iterator(local_patches.begin()),
+                       std::make_move_iterator(local_patches.end()));
+      }
     }
   };
 
   parallel_for(worker, overlap.size(), 0);
   for (auto &&polygon : extra_polygons) {
     water_shp.append(std::move(polygon));
+  }
+  if (collect_patches) {
+    for (auto &&polygon : patches) {
+      patches_out->append(std::move(polygon));
+    }
   }
 }
 

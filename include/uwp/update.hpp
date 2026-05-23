@@ -34,9 +34,25 @@ auto select_overlap(const Shapefile &water_shp,
                     double max_inland_km = 0.0)
     -> std::vector<std::pair<size_t, std::vector<Polygon>>>;
 
+/// @brief Merge the selected area polygons into the matching water polygons.
+///
+/// For each `(water_idx, area_polygons)` entry in `overlap`:
+///   1. Cascade-union the area polygons.
+///   2. Union the result with `water_shp.polygons()[water_idx]` in place.
+///   3. Any extra disconnected pieces are appended at the end of
+///      `water_shp` (as new polygons).
+///
+/// @param[in,out] water_shp Coastal shapefile to mutate.
+/// @param[in] overlap Output of `select_overlap`.
+/// @param[in,out] patches_out Optional. If non-null, every polygon piece
+///   that contributes to the merge — both the one fused into the water
+///   polygon and the disconnected extras — is appended to this shapefile.
+///   This gives the caller an exhaustive ground-truth record of what was
+///   added, ready to be saved as a stand-alone shapefile for QA. Pass
+///   nullptr to preserve the historical behaviour (no patches tracked).
 auto merge_overlapping(
     Shapefile &water_shp,
-    const std::vector<std::pair<size_t, std::vector<Polygon>>> &overlap)
-    -> void;
+    const std::vector<std::pair<size_t, std::vector<Polygon>>> &overlap,
+    Shapefile *patches_out = nullptr) -> void;
 
 }  // namespace uwp

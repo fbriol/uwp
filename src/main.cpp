@@ -10,7 +10,7 @@ int main(int argc, char* argv[]) {
   if (argc < 2) {
     std::cerr << "Usage: " << argv[0]
               << " water_polygon [-o water_polygon_output]"
-                 " [--max-inland-km N]"
+                 " [--max-inland-km N] [--patches-output patches.shp]"
                  " region_polygon1 [region_polygon2 ...]"
               << std::endl;
     return 1;
@@ -21,8 +21,10 @@ int main(int argc, char* argv[]) {
 
   // Parse the arguments to find -o option and region files
   std::string output_file;
+  std::string patches_output_file;
   std::vector<std::string> region_files;
   bool output_specified = false;
+  bool patches_output_specified = false;
 
   // Inland-distance cap: regional water polygons extending more than this many
   // kilometres beyond the matched coastal water polygon's envelope are clipped
@@ -48,6 +50,9 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error: --max-inland-km must be >= 0" << std::endl;
         return 1;
       }
+    } else if (arg == "--patches-output" && i + 1 < argc) {
+      patches_output_file = argv[++i];
+      patches_output_specified = true;
     } else if (arg.length() > 1 && arg[0] == '-') {
       std::cerr << "Error: Unsupported option " << arg << std::endl;
       return 1;
@@ -70,10 +75,19 @@ int main(int argc, char* argv[]) {
   if (max_inland_km > 0.0) {
     std::cout << "Inland-distance cap: " << max_inland_km << " km" << std::endl;
   }
+  if (patches_output_specified) {
+    std::cout << "Patches output: " << patches_output_file << std::endl;
+  }
 
   // Load the water shapefile
   auto water_shp = uwp::Shapefile(water_file);
   water_shp.build_rtree_index();
+
+  // Accumulator for the patches across every processed region. Stays empty
+  // (and is never saved) unless --patches-output was passed.
+  auto patches_shp = uwp::Shapefile();
+  uwp::Shapefile* patches_ptr =
+      patches_output_specified ? &patches_shp : nullptr;
 
   // Process each region polygon. The region set is much smaller than the
   // water set, so we drive the loop by region polygons and query the water
@@ -85,12 +99,18 @@ int main(int argc, char* argv[]) {
 
     auto overlap =
         uwp::select_overlap(water_shp, *(area_shp.polygons()), max_inland_km);
-    uwp::merge_overlapping(water_shp, overlap);
+    uwp::merge_overlapping(water_shp, overlap, patches_ptr);
   }
 
   // Save the final result
   std::cout << "Saving result to: " << output_file << std::endl;
   water_shp.save(output_file);
+
+  if (patches_output_specified) {
+    std::cout << "Saving patches (" << patches_shp.size()
+              << " polygons) to: " << patches_output_file << std::endl;
+    patches_shp.save(patches_output_file);
+  }
 
   return 0;
 }
