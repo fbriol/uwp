@@ -154,6 +154,10 @@ if [[ "${UWP_DISABLE_SSL_VERIFY:-0}" == "1" ]] \
 # Disables TLS verification so libmamba can talk to conda-forge through
 # the CNES corporate TLS-interception proxy.
 ssl_verify: false
+# Strict channel priority restricts the solver to packages from the first
+# matching channel (conda-forge in our environment.yml). Cheap speed-up,
+# also makes the resolution deterministic across machines.
+channel_priority: strict
 EOF
   export CONDARC="$UWP_RC_FILE"
   export MAMBARC="$UWP_RC_FILE"
@@ -185,13 +189,11 @@ fi
 # ----------------------------------------------------------------------------
 [[ -f "$ENV_FILE" ]] || die "Environment file not found: $ENV_FILE"
 
+# Note: we used to add --strict-channel-priority here, but the `env`
+# subcommands of mamba 2.x reject it (it is a `mamba install` flag only).
+# Strict priority is enforced declaratively via `channel_priority: strict`
+# in the rc file when one is active (see CNES section above).
 ENV_EXTRA_ARGS=()
-# --strict-channel-priority: only consider packages from conda-forge (declared
-# in environment.yml). Eliminates conflict checks against the default channels
-# the solver would otherwise also explore — significant speed-up.
-if [[ "$CONDA_TOOL" == "mamba" ]] || [[ "$CONDA_TOOL" == "conda" ]]; then
-  ENV_EXTRA_ARGS+=(--strict-channel-priority)
-fi
 
 # An env at a specific prefix exists iff its conda-meta dir is populated.
 # `env list` doesn't always show prefix-based envs, so we check the path
