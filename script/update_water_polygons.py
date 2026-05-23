@@ -642,7 +642,16 @@ def convert_to_shp(region: str, sub_region: str) -> None:
     water_pbf = osm_pbf.parent / f'{region}-water.osm.pbf'
 
     ogr_env = os.environ.copy()
-    ogr_env['OGR_GEOMETRY_ACCEPT_UNCLOSED_RING'] = 'NO'
+    # Accept rings whose last vertex doesn't repeat the first. GDAL closes
+    # them automatically (appends the start vertex at the end). The
+    # alternative — setting this to NO — has GDAL print
+    #   ERROR 1: Non closed ring detected.
+    # for every offending feature and *drop* it. OSM multipolygon relations
+    # often have a tiny ring-closure bug at tile boundaries; rejecting them
+    # makes us lose the very estuary / lagoon we want to merge into the
+    # coastline. Auto-closing produces a valid polygon that bg::union_
+    # downstream handles without issue.
+    ogr_env['OGR_GEOMETRY_ACCEPT_UNCLOSED_RING'] = 'YES'
     # Point GDAL's OSM driver at our custom config that exposes the
     # `water` tag. Without it the -where filter below fails because GDAL's
     # default config doesn't surface `water=*` as a column.
