@@ -43,12 +43,12 @@ DEFAULT_PATCHES = DATA_DIR / 'patches.shp'
 
 
 def _process_cell(
-    cell_id: str,
-    cell_bbox: tuple[float, float, float, float],
+    shard_id: str,
+    shard_bbox: tuple[float, float, float, float],
     patches_path: pathlib.Path,
     output_dir: pathlib.Path,
-    min_cluster_km2: float,
-    cluster_buffer_km: float,
+    geohash_precision: int,
+    min_cell_km2: float,
     prefilter_km2: float,
     dpi: int,
     with_basemap: bool,
@@ -57,17 +57,20 @@ def _process_cell(
     basemap_cache_dir: pathlib.Path | None = None,
 ) -> list[dict]:
     """Top-level worker for ProcessPoolExecutor. Reads the patches slice
-    intersecting `cell_bbox`, filters/clusters/renders, returns the
-    per-cluster metadata."""
+    intersecting `shard_bbox` (a level-1 geohash cell), groups by
+    geohash at the user-requested precision, and renders one PNG per
+    non-empty cell."""
     logging.basicConfig(
         level=logging.INFO,
-        format=f'%(asctime)s - [cell {cell_id}] %(levelname)s - %(message)s',
+        format=(
+            f'%(asctime)s - [shard {shard_id}] %(levelname)s - %(message)s'
+        ),
         force=True,
     )
     if with_basemap and basemap_cache_dir is not None:
         common.configure_basemap_cache(basemap_cache_dir)
 
-    patches = gpd.read_file(patches_path, bbox=cell_bbox)
+    patches = gpd.read_file(patches_path, bbox=shard_bbox)
     if patches.empty:
         return []
     if patches.crs is None:
@@ -77,35 +80,28 @@ def _process_cell(
     if patches.empty:
         return []
 
-    clustered = common.cluster_pieces(patches, cluster_buffer_km)
-    candidates = common.rank_clusters(clustered, min_cluster_km2)
-    if max_images and len(candidates) > max_images:
-        candidates = candidates[:max_images]
+    patches = common.assign_geohash(patches, geohash_precision)
+    cells = common.group_by_geohash(patches, min_cell_km2)
+    if max_images and len(cells) > max_images:
+        cells = cells[:max_images]
 
     rendered: list[dict] = []
     png_dir = output_dir / 'png'
-    for cluster_id, _area, pieces, union in candidates:
-        centroid = union.centroid
-        name = (
-            f'cell_{cell_id}_cluster_{cluster_id:05d}_'
-            f'{centroid.y:+09.4f}_{centroid.x:+010.4f}.png'
-        )
+    for geohash, _area, pieces_in_cell in cells:
+        name = f'gh_{geohash}.png'
         try:
-            rec = common.render_cluster(
-                cluster_id,
-                pieces,
+            rec = common.render_geohash_cell(
+                geohash,
+                pieces_in_cell,
                 png_dir / name,
                 dpi=dpi,
                 with_basemap=with_basemap,
                 basemap_provider=basemap_provider,
             )
-            rec['cell'] = cell_id
             rendered.append(rec)
         except Exception:
-            LOGGER.exception(
-                'Failed rendering cell %s cluster %d', cell_id, cluster_id
-            )
-    LOGGER.info('Cell %s done: %d image(s)', cell_id, len(rendered))
+            LOGGER.exception('Failed rendering geohash %s', geohash)
+    LOGGER.info('Shard %s done: %d image(s)', shard_id, len(rendered))
     return rendered
 
 
@@ -156,29 +152,29 @@ def main() -> None:
     prefilter_km2 = (
         args.prefilter_km2
         if args.prefilter_km2 is not None
-        else args.min_cluster_km2 / 20.0
+        else args.min_cell_km2 / 20.0
     )
 
     user_bbox = tuple(args.bbox) if args.bbox else None
-    cells = common.select_cells(user_bbox)
-    parallel = common.auto_parallelism(args.parallel_cells, len(cells))
+    shards = common.select_cells(user_bbox)  # level-1 cells for I/O
+    parallel = common.auto_parallelism(args.parallel_cells, len(shards))
 
     LOGGER.info(
-        'Patches: %s | cells=%d | workers=%d | '
-        'prefilter=%g km² | min_cluster=%g km² | max_images/cell=%d',
+        'Patches: %s | shards=%d | workers=%d | '
+        'geohash precision=%d | prefilter=%g km² | min_cell=%g km²',
         args.patches,
-        len(cells),
+        len(shards),
         parallel,
+        args.geohash_precision,
         prefilter_km2,
-        args.min_cluster_km2,
-        args.max_images,
+        args.min_cell_km2,
     )
 
     worker_kwargs = {
         'patches_path': args.patches,
         'output_dir': args.output,
-        'min_cluster_km2': args.min_cluster_km2,
-        'cluster_buffer_km': args.cluster_buffer_km,
+        'geohash_precision': args.geohash_precision,
+        'min_cell_km2': args.min_cell_km2,
         'prefilter_km2': prefilter_km2,
         'dpi': args.dpi,
         'with_basemap': args.basemap,
@@ -188,20 +184,20 @@ def main() -> None:
     }
 
     records = common.run_cells_parallel(
-        cells, _process_cell, worker_kwargs, parallel
+        shards, _process_cell, worker_kwargs, parallel
     )
 
     if not records:
         LOGGER.warning(
-            'No cluster met the --min-cluster-km2=%g threshold.',
-            args.min_cluster_km2,
+            'No geohash cell met the --min-cell-km2=%g threshold.',
+            args.min_cell_km2,
         )
         return
 
     total_km2 = sum(r['added_km2'] for r in records)
     summary = (
-        f'{len(records)} cluster(s) rendered across {len(cells)} '
-        f'geohash-1 cell(s) (total added: {total_km2:.2f} km²) '
+        f'{len(records)} geohash-{args.geohash_precision} cell(s) rendered '
+        f'(total added: {total_km2:.2f} km²) '
         f'from <code>{args.patches}</code>.'
     )
     common.write_atlas(args.output, records, summary)

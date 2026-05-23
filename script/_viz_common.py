@@ -75,22 +75,81 @@ _GEOHASH_BASE32 = '0123456789bcdefghjkmnpqrstuvwxyz'
 # ---------------------------------------------------------------------------
 
 
-def geohash1_bbox(char: str) -> tuple[float, float, float, float]:
-    """(minlon, minlat, maxlon, maxlat) for a 1-char geohash cell.
+def geohash_bbox(geohash: str) -> tuple[float, float, float, float]:
+    """(minlon, minlat, maxlon, maxlat) for an arbitrary-length geohash.
 
-    Bit interleaving: the 5 bits of a 1-char geohash are split lon, lat,
-    lon, lat, lon (most significant first). Decoding gives 3 lon bits
-    (8 cells) and 2 lat bits (4 cells).
+    Each character subdivides the cell along 5 bits, alternating lon
+    (first bit) and lat. Standard geohash decoding.
+
+    Precision examples:
+      length 1 → 32 cells of 45 by 45 deg
+      length 2 → 1024 cells of ~5.6 by 5.6 deg
+      length 3 → 32768 cells of ~0.7 by 0.7 deg
     """
-    idx = _GEOHASH_BASE32.index(char.lower())
-    bits = [(idx >> i) & 1 for i in range(4, -1, -1)]
-    lon_idx = (bits[0] << 2) | (bits[2] << 1) | bits[4]
-    lat_idx = (bits[1] << 1) | bits[3]
-    lon_step = 360.0 / 8
-    lat_step = 180.0 / 4
-    minlon = -180.0 + lon_idx * lon_step
-    minlat = -90.0 + lat_idx * lat_step
-    return (minlon, minlat, minlon + lon_step, minlat + lat_step)
+    minlon, maxlon = -180.0, 180.0
+    minlat, maxlat = -90.0, 90.0
+    is_lon = True  # bit 0 of bit 0 of char 0 picks longitude half
+    for char in geohash.lower():
+        idx = _GEOHASH_BASE32.index(char)
+        for shift in range(4, -1, -1):
+            bit = (idx >> shift) & 1
+            if is_lon:
+                mid = (minlon + maxlon) / 2
+                if bit:
+                    minlon = mid
+                else:
+                    maxlon = mid
+            else:
+                mid = (minlat + maxlat) / 2
+                if bit:
+                    minlat = mid
+                else:
+                    maxlat = mid
+            is_lon = not is_lon
+    return (minlon, minlat, maxlon, maxlat)
+
+
+def geohash1_bbox(char: str) -> tuple[float, float, float, float]:
+    """Compatibility shim: bbox for a 1-character geohash cell."""
+    return geohash_bbox(char)
+
+
+def encode_geohash(lon: float, lat: float, precision: int) -> str:
+    """Encode a (lon, lat) point to a geohash of the given precision.
+
+    Iteratively refines lon / lat ranges, alternating bits. Returns a
+    string of `precision` base32 characters.
+    """
+    minlon, maxlon = -180.0, 180.0
+    minlat, maxlat = -90.0, 90.0
+    bits: list[int] = []
+    chars: list[str] = []
+    is_lon = True
+    while len(chars) < precision:
+        if is_lon:
+            mid = (minlon + maxlon) / 2
+            if lon >= mid:
+                bits.append(1)
+                minlon = mid
+            else:
+                bits.append(0)
+                maxlon = mid
+        else:
+            mid = (minlat + maxlat) / 2
+            if lat >= mid:
+                bits.append(1)
+                minlat = mid
+            else:
+                bits.append(0)
+                maxlat = mid
+        is_lon = not is_lon
+        if len(bits) == 5:
+            idx = 0
+            for b in bits:
+                idx = (idx << 1) | b
+            chars.append(_GEOHASH_BASE32[idx])
+            bits = []
+    return ''.join(chars)
 
 
 def intersect_bboxes(
@@ -193,70 +252,59 @@ def prefilter_by_area(
     return kept
 
 
-def cluster_pieces(
-    pieces: gpd.GeoDataFrame, buffer_km: float
+def assign_geohash(
+    pieces: gpd.GeoDataFrame, precision: int
 ) -> gpd.GeoDataFrame:
-    """Buffer + union + connected components to group adjacent pieces.
+    """Add a `geohash` column to `pieces` by encoding each polygon's
+    centroid at the given precision.
 
-    Returns a copy of `pieces` with a `cluster_id` column. Pieces within
-    `buffer_km` of each other end up in the same cluster — so an estuary
-    split across several base polygons renders as a single image.
+    The cell grid is deterministic (no proximity clustering), so the
+    number of produced cells is bounded above by `32 ** precision` and
+    the partition is reproducible across runs. Border polygons get
+    assigned to whichever cell contains their centroid — for QA viz
+    that's good enough.
     """
     if pieces.empty:
         out = pieces.copy()
-        out['cluster_id'] = []
+        out['geohash'] = []
         return out
-
     with suppress_geographic_crs_warning():
-        centroid_lats = pieces.geometry.centroid.y
-        lat_mid = float(centroid_lats.mean())
-        buffer_deg = km_to_deg(buffer_km / 2, lat_mid)
-
-        buffered = pieces.geometry.buffer(buffer_deg)
-        dissolved = unary_union(buffered.values)
-        components = (
-            [dissolved]
-            if dissolved.geom_type == 'Polygon'
-            else list(dissolved.geoms)
-        )
-        cluster_gdf = gpd.GeoDataFrame(
-            {'cluster_id': range(len(components))},
-            geometry=components,
-            crs=pieces.crs,
-        )
-        centroids = gpd.GeoDataFrame(
-            pieces.drop(columns='geometry'),
-            geometry=pieces.geometry.centroid,
-            crs=pieces.crs,
-        )
-        joined = gpd.sjoin(
-            centroids, cluster_gdf, how='left', predicate='within'
-        )
+        cent_x = pieces.geometry.centroid.x.values
+        cent_y = pieces.geometry.centroid.y.values
+    geohashes = [
+        encode_geohash(float(lon), float(lat), precision)
+        for lon, lat in zip(cent_x, cent_y, strict=True)
+    ]
     out = pieces.copy()
-    out['cluster_id'] = joined['cluster_id'].astype('Int64').values
+    out['geohash'] = geohashes
     return out
 
 
-def rank_clusters(
-    clustered: gpd.GeoDataFrame, min_cluster_km2: float
-) -> list[tuple[int, float, gpd.GeoDataFrame, object]]:
-    """Return (cluster_id, area_km2, pieces, union) sorted by area desc,
-    dropping clusters below `min_cluster_km2`."""
-    cluster_count = int(clustered['cluster_id'].max()) + 1
-    candidates: list[tuple[int, float, gpd.GeoDataFrame, object]] = []
-    for cluster_id in range(cluster_count):
-        pieces = clustered[clustered['cluster_id'] == cluster_id]
-        if pieces.empty:
+def group_by_geohash(
+    pieces: gpd.GeoDataFrame, min_cell_km2: float
+) -> list[tuple[str, float, gpd.GeoDataFrame]]:
+    """Group polygons by their `geohash` column and return cells sorted by
+    total area descending. Cells whose summed added area is below
+    `min_cell_km2` are dropped.
+
+    Returns a list of `(geohash, area_km2, pieces_in_cell)`.
+    """
+    if pieces.empty or 'geohash' not in pieces.columns:
+        return []
+    cells: list[tuple[str, float, gpd.GeoDataFrame]] = []
+    for gh, sub in pieces.groupby('geohash', sort=False):
+        if sub.empty:
             continue
-        with suppress_geographic_crs_warning():
-            lat_mid = float(pieces.geometry.centroid.y.mean())
-        union = unary_union(pieces.geometry.values)
-        area = area_km2(union, lat_mid)
-        if area < min_cluster_km2:
+        # Bbox center latitude is a good-enough reference for the local
+        # cos(lat) area correction — the cell is small.
+        bbox = geohash_bbox(gh)
+        lat_mid = (bbox[1] + bbox[3]) / 2
+        total = area_km2(unary_union(sub.geometry.values), lat_mid)
+        if total < min_cell_km2:
             continue
-        candidates.append((cluster_id, area, pieces, union))
-    candidates.sort(key=lambda x: -x[1])
-    return candidates
+        cells.append((gh, total, sub))
+    cells.sort(key=lambda x: -x[1])
+    return cells
 
 
 # ---------------------------------------------------------------------------
@@ -296,44 +344,37 @@ def configure_basemap_cache(cache_dir: pathlib.Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _render_with_basemap(
-    ax,
-    pieces_3857: gpd.GeoDataFrame,
-    extent_4326: tuple[float, float, float, float],
-    cluster_id: int,
-    basemap_provider: str,
-    reference_3857: gpd.GeoDataFrame | None = None,
-    revised_3857: gpd.GeoDataFrame | None = None,
-) -> None:
-    """Overlay the patch pieces (and optionally reference/revised outlines)
-    on a tile basemap in Web Mercator. Tile fetch is best-effort: on 429
-    or connection issues we just continue with a blank background."""
-    if reference_3857 is not None:
-        reference_3857.boundary.plot(
-            ax=ax, edgecolor='#1f77b4', linewidth=0.6, alpha=0.8
-        )
-    if revised_3857 is not None:
-        revised_3857.boundary.plot(
-            ax=ax, edgecolor='#d62728', linewidth=0.9, alpha=0.9
-        )
-    pieces_3857.plot(ax=ax, color='#ffdd44', alpha=0.55, edgecolor='#ff8c00')
+def _polygon_colors(n: int) -> list:
+    """Build a list of `n` distinct fill colours by cycling through
+    qualitative colormaps.
 
-    minx, miny, maxx, maxy = extent_4326
-    extent_box_3857 = (
-        gpd.GeoSeries([box(minx, miny, maxx, maxy)], crs=4326)
-        .to_crs(3857)
-        .total_bounds
-    )
-    ax.set_xlim(extent_box_3857[0], extent_box_3857[2])
-    ax.set_ylim(extent_box_3857[1], extent_box_3857[3])
+    `tab20` gives 20 well-separated colours. For more we wrap and accept
+    repeats — alphabetical neighbours rarely get the same colour, which
+    keeps the overlay readable in practice.
+    """
+    cmap = matplotlib.colormaps.get_cmap('tab20')
+    return [cmap(i % cmap.N) for i in range(n)]
+
+
+def _add_basemap_safely(
+    ax,
+    extent_3857: tuple[float, float, float, float],
+    basemap_provider: str,
+    label: str,
+) -> None:
+    """Set axis extent in Web Mercator and lay a basemap tile underneath.
+    Tile fetch is best-effort: on 429 or connection issues we just
+    continue with a blank background — the overlay is still readable."""
+    ax.set_xlim(extent_3857[0], extent_3857[2])
+    ax.set_ylim(extent_3857[1], extent_3857[3])
     ax.set_aspect('equal')
     try:
         provider = resolve_basemap_provider(basemap_provider)
         cx.add_basemap(ax, source=provider, attribution_size=5)
     except Exception as exc:
         LOGGER.warning(
-            'Basemap fetch failed for cluster %d (provider=%s): %s',
-            cluster_id,
+            'Basemap fetch failed for %s (provider=%s): %s',
+            label,
             basemap_provider,
             exc,
         )
@@ -341,9 +382,9 @@ def _render_with_basemap(
     ax.set_yticks([])
 
 
-def render_cluster(
-    cluster_id: int,
-    cluster_pieces: gpd.GeoDataFrame,
+def render_geohash_cell(
+    geohash: str,
+    pieces: gpd.GeoDataFrame,
     output_path: pathlib.Path,
     dpi: int,
     with_basemap: bool,
@@ -351,88 +392,102 @@ def render_cluster(
     reference: gpd.GeoDataFrame | None = None,
     revised: gpd.GeoDataFrame | None = None,
 ) -> dict:
-    """Render one cluster as a PNG. Returns metadata dict for the atlas."""
-    bounds = cluster_pieces.total_bounds
-    minx, miny, maxx, maxy = bounds
-    pad_x = max(0.005, (maxx - minx) * 0.25)
-    pad_y = max(0.005, (maxy - miny) * 0.25)
-    extent_minx = minx - pad_x
-    extent_miny = max(-90.0, miny - pad_y)
-    extent_maxx = maxx + pad_x
-    extent_maxy = min(90.0, maxy + pad_y)
+    """Render every polygon in a geohash cell, each in a distinct colour.
 
-    # Optionally clip context layers (reference / revised) to the extent.
+    The extent of the figure is the geohash cell itself (not the pieces'
+    bbox) so adjacent cells line up perfectly in the atlas and the user
+    can mentally tile them. A thin grey outline around the cell bbox
+    makes the boundary explicit.
+
+    Optional `reference` / `revised` layers (used by visualize_diff) are
+    clipped to the cell extent and drawn as boundary outlines (blue /
+    red) underneath the coloured patches.
+
+    Returns the metadata record for the atlas index.
+    """
+    minlon, minlat, maxlon, maxlat = geohash_bbox(geohash)
+    # No padding — the extent IS the cell. Atlas tiles align then.
     ref_local = None
     rev_local = None
     if reference is not None:
-        ref_local = reference.cx[
-            extent_minx:extent_maxx, extent_miny:extent_maxy
-        ]
+        ref_local = reference.cx[minlon:maxlon, minlat:maxlat]
     if revised is not None:
-        rev_local = revised.cx[
-            extent_minx:extent_maxx,
-            extent_miny:extent_maxy,
-        ]
+        rev_local = revised.cx[minlon:maxlon, minlat:maxlat]
 
     fig, ax = plt.subplots(figsize=(10, 10), dpi=dpi)
+    colors = _polygon_colors(len(pieces))
 
     if with_basemap and _HAVE_CONTEXTILY:
-        pieces_3857 = cluster_pieces.to_crs(3857)
-        ref_3857 = ref_local.to_crs(3857) if ref_local is not None else None
-        rev_3857 = rev_local.to_crs(3857) if rev_local is not None else None
-        _render_with_basemap(
-            ax,
-            pieces_3857,
-            (extent_minx, extent_miny, extent_maxx, extent_maxy),
-            cluster_id,
-            basemap_provider,
-            reference_3857=ref_3857,
-            revised_3857=rev_3857,
+        pieces_3857 = pieces.to_crs(3857)
+        if ref_local is not None and not ref_local.empty:
+            ref_local.to_crs(3857).boundary.plot(
+                ax=ax, edgecolor='#1f77b4', linewidth=0.5, alpha=0.7
+            )
+        if rev_local is not None and not rev_local.empty:
+            rev_local.to_crs(3857).boundary.plot(
+                ax=ax, edgecolor='#d62728', linewidth=0.7, alpha=0.85
+            )
+        pieces_3857.plot(
+            ax=ax,
+            color=colors,
+            edgecolor='black',
+            linewidth=0.3,
+            alpha=0.75,
+        )
+        extent_3857 = (
+            gpd.GeoSeries([box(minlon, minlat, maxlon, maxlat)], crs=4326)
+            .to_crs(3857)
+            .total_bounds
+        )
+        _add_basemap_safely(
+            ax, extent_3857, basemap_provider, f'cell {geohash}'
         )
     else:
-        if ref_local is not None:
+        if ref_local is not None and not ref_local.empty:
             ref_local.boundary.plot(
                 ax=ax,
                 edgecolor='#1f77b4',
-                linewidth=0.6,
+                linewidth=0.5,
                 label='reference',
-                alpha=0.8,
+                alpha=0.7,
             )
-        if rev_local is not None:
+        if rev_local is not None and not rev_local.empty:
             rev_local.boundary.plot(
                 ax=ax,
                 edgecolor='#d62728',
-                linewidth=0.9,
+                linewidth=0.7,
                 label='revised',
-                alpha=0.9,
+                alpha=0.85,
             )
-        cluster_pieces.plot(
+        pieces.plot(
             ax=ax,
-            color='#ffdd44',
-            edgecolor='#ff8c00',
-            alpha=0.55,
-            label='added',
+            color=colors,
+            edgecolor='black',
+            linewidth=0.3,
+            alpha=0.75,
         )
-        ax.set_xlim(extent_minx, extent_maxx)
-        ax.set_ylim(extent_miny, extent_maxy)
+        ax.set_xlim(minlon, maxlon)
+        ax.set_ylim(minlat, maxlat)
         ax.set_aspect('equal')
-        if ref_local is not None or rev_local is not None:
+        if (ref_local is not None and not ref_local.empty) or (
+            rev_local is not None and not rev_local.empty
+        ):
             ax.legend(loc='best', framealpha=0.85)
         ax.set_xlabel('Longitude')
         ax.set_ylabel('Latitude')
         ax.grid(True, linestyle=':', alpha=0.4)
 
-    center_lon = (minx + maxx) / 2
-    center_lat = (miny + maxy) / 2
-    union_geom = unary_union(cluster_pieces.geometry.values)
+    center_lon = (minlon + maxlon) / 2
+    center_lat = (minlat + maxlat) / 2
+    union_geom = unary_union(pieces.geometry.values)
     total_km2 = area_km2(union_geom, center_lat)
 
     fig.suptitle(
-        f'Cluster #{cluster_id} — '
+        f'Geohash {geohash} — '
         f'{center_lat:+.4f}°, {center_lon:+.4f}° '
         f'— added: {total_km2:.3f} km² '
-        f'({len(cluster_pieces)} piece'
-        f'{"s" if len(cluster_pieces) > 1 else ""})',
+        f'({len(pieces)} polygon'
+        f'{"s" if len(pieces) > 1 else ""})',
         fontsize=12,
     )
     fig.tight_layout()
@@ -441,11 +496,11 @@ def render_cluster(
     plt.close(fig)
 
     return {
-        'cluster_id': cluster_id,
+        'geohash': geohash,
         'center_lat': center_lat,
         'center_lon': center_lon,
         'added_km2': total_km2,
-        'num_pieces': len(cluster_pieces),
+        'num_pieces': len(pieces),
         'image': output_path.name,
     }
 
@@ -476,8 +531,8 @@ _HTML_TEMPLATE = """<!doctype html>
 <p>{summary}</p>
 <table id="atlas">
 <thead><tr>
-  <th>#</th><th>Cell</th><th>Preview</th><th>Center</th>
-  <th>Added (km²)</th><th>Pieces</th>
+  <th>Geohash</th><th>Preview</th><th>Center</th>
+  <th>Added (km²)</th><th>Polygons</th>
 </tr></thead>
 <tbody>
 {rows}
@@ -493,14 +548,13 @@ def write_atlas(
 ) -> None:
     records_sorted = sorted(records, key=lambda r: -r['added_km2'])
 
-    csv_path = output_dir / 'clusters.csv'
+    csv_path = output_dir / 'cells.csv'
     pd.DataFrame(records_sorted).to_csv(csv_path, index=False)
     LOGGER.info('Wrote %s', csv_path)
 
     rows_html = [
         '<tr>'
-        f'<td>{rec["cluster_id"]}</td>'
-        f'<td><code>{html.escape(rec.get("cell", "?"))}</code></td>'
+        f'<td><code>{html.escape(rec["geohash"])}</code></td>'
         f'<td><a href="png/{html.escape(rec["image"])}">'
         f'<img src="png/{html.escape(rec["image"])}" loading="lazy">'
         '</a></td>'
@@ -523,7 +577,7 @@ def write_atlas(
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
-    """Inject the shared CLI flags (rendering, clustering, parallelism)."""
+    """Inject the shared CLI flags (rendering, geohash, parallelism)."""
     parser.add_argument(
         '--output',
         type=pathlib.Path,
@@ -531,23 +585,27 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help='Output directory for PNGs and index.',
     )
     parser.add_argument(
-        '--min-cluster-km2',
-        type=float,
-        default=1.0,
-        help='Skip clusters whose total area is below this threshold.',
+        '--geohash-precision',
+        type=int,
+        default=2,
+        help='Geohash length used to grid the globe. Each character '
+        'subdivides cells along 5 bits → image count is bounded above by '
+        '32^precision. Recommended: 1 (very coarse, ~45deg cells, up to '
+        '32 images), 2 (~5.6deg, up to 1024), 3 (~0.7deg, up to 32768). '
+        'Only non-empty cells produce an image.',
     )
     parser.add_argument(
-        '--cluster-buffer-km',
+        '--min-cell-km2',
         type=float,
-        default=5.0,
-        help='Maximum distance between pieces for them to share a cluster.',
+        default=1.0,
+        help='Skip cells whose total added area is below this threshold.',
     )
     parser.add_argument(
         '--prefilter-km2',
         type=float,
         default=None,
-        help='Drop individual pieces smaller than this BEFORE clustering. '
-        'Default: --min-cluster-km2 / 20.',
+        help='Drop individual pieces smaller than this BEFORE grouping. '
+        'Default: --min-cell-km2 / 20.',
     )
     parser.add_argument(
         '--dpi',
@@ -575,9 +633,9 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         '--max-images',
         type=int,
-        default=200,
-        help='Cap on number of rendered images (per cell when sharded). '
-        '0 = unlimited.',
+        default=0,
+        help='Cap on number of rendered images per shard. 0 = unlimited '
+        '(default — geohash precision already bounds the total).',
     )
     parser.add_argument(
         '--bbox',
