@@ -114,6 +114,25 @@ python script/update_water_polygons.py [--areas REGION ...]
 | `--extract-jobs` | `2` | Number of concurrent **extractions** (osmium + ogr2ogr). osmium is already multi-threaded internally, so the default is intentionally small to avoid CPU oversubscription. Increase on idle machines. |
 | `--force` | off | Ignore the manifest and re-download / re-extract every selected region. Use after dependency upgrades or to recover from a corrupted cache. |
 | `--check-only` | off | Print the list of regions that would be refreshed and exit, without downloading or running the binary. Handy to estimate the size of an update. |
+| `--max-retries` | `5` | Retry budget for transient download / HEAD failures (exponential backoff with jitter). |
+| `--max-inland-km` | `0` (off) | Clip regional water polygons that extend more than this many km beyond the matched coastal polygon's envelope. Stops giant river polygons from dragging the coastline deep inland. Typical values: 100-500. |
+
+## What gets extracted from OSM
+
+The osmium + ogr2ogr extraction step takes every `natural=water` polygon
+from a region's PBF, then drops the narrow / linear sub-types via an
+`ogr2ogr -where` clause:
+
+```sql
+water IS NULL OR water NOT IN ('stream', 'canal', 'ditch', 'drain')
+```
+
+This keeps lakes, lagoons, bays, reservoirs, and rivers (whose `water=*`
+tag is `lake`, `lagoon`, `bay`, `river`, …, or absent), and drops streams,
+canals, ditches, and drains — which are typically modelled as long thin
+polygons that, if absorbed into the coastline, pull it far inland. The
+remaining `water=river` polygons are still kept; pair this with
+`--max-inland-km` to truncate them at a sensible distance from the coast.
 
 ## Two-stage pipeline
 
