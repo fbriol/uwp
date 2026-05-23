@@ -60,6 +60,49 @@ else
 fi
 log "Using $CONDA_TOOL ($(command -v $CONDA_TOOL))"
 
+# ----------------------------------------------------------------------------
+# Choose where the env lives.
+#
+# Default behaviour of `conda/mamba env create --name X` is to put the env
+# under the first writable entry of `envs_dirs`, which on a fresh install is
+# `~/.conda/envs/`. On the CNES cluster (and many HPCs) the user's HOME has
+# a small quota that the env quickly fills up, so we want the env to live
+# under the mamba install root instead (typically `<install>/envs/`).
+#
+# Strategy:
+#   1. If UWP_ENV_PREFIX is set, use it as-is.
+#   2. Otherwise auto-detect the mamba/conda root prefix and build
+#      "<root>/envs/<ENV_NAME>".
+#   3. Pass it via `--prefix` instead of `--name`.
+#
+# Using --prefix bypasses the envs_dirs config entirely — the env goes
+# exactly where we ask, no matter what's in ~/.condarc.
+if [[ -n "${UWP_ENV_PREFIX:-}" ]]; then
+  ENV_PREFIX="$UWP_ENV_PREFIX"
+else
+  # `$CONDA_TOOL info --base` prints the root install dir. Fall back to
+  # `dirname $(dirname $(which ...))` if `info --base` is unsupported
+  # (very old conda).
+  ROOT_PREFIX="$(
+    $CONDA_TOOL info --base 2>/dev/null \
+      || dirname "$(dirname "$(command -v "$CONDA_TOOL")")"
+  )"
+  if [[ -z "$ROOT_PREFIX" ]] || [[ ! -d "$ROOT_PREFIX" ]]; then
+    die "Could not determine $CONDA_TOOL root prefix. Set UWP_ENV_PREFIX explicitly."
+  fi
+  ENV_PREFIX="$ROOT_PREFIX/envs/$ENV_NAME"
+fi
+log "Env prefix: $ENV_PREFIX"
+
+# Sanity check: refuse to put the env under HOME unless the user is
+# explicit. Keeps a misconfigured cluster from filling up the HOME quota.
+if [[ "$ENV_PREFIX" == "$HOME"* ]] \
+   && [[ "${UWP_ALLOW_HOME_ENV:-0}" != "1" ]]; then
+  die "Resolved ENV_PREFIX is under \$HOME ($ENV_PREFIX). Set UWP_ENV_PREFIX
+       to a path outside HOME (scratch / work), or set UWP_ALLOW_HOME_ENV=1
+       to silence this check."
+fi
+
 # CNES HPC detection: hostnames look like trex001.sis.cnes.fr, hal0123.cnes.fr,
 # etc. The cluster's outbound TLS interception (self-signed CA in the chain)
 # breaks both the Python conda layer and the C++ libmamba solver used by
@@ -126,28 +169,34 @@ if [[ "$CONDA_TOOL" == "mamba" ]] || [[ "$CONDA_TOOL" == "conda" ]]; then
   ENV_EXTRA_ARGS+=(--strict-channel-priority)
 fi
 
-if $CONDA_TOOL env list | awk 'NR>2 {print $1}' | grep -qx "$ENV_NAME"; then
-  log "Updating existing conda env '$ENV_NAME' from $ENV_FILE"
+# An env at a specific prefix exists iff its conda-meta dir is populated.
+# `env list` doesn't always show prefix-based envs, so we check the path
+# directly — more reliable.
+if [[ -d "$ENV_PREFIX/conda-meta" ]]; then
+  log "Updating existing conda env at $ENV_PREFIX from $ENV_FILE"
   PRUNE_ARGS=()
   if [[ "$UWP_PRUNE" == "1" ]]; then
     log "UWP_PRUNE=1 → forcing full --prune re-solve (slower)"
     PRUNE_ARGS+=(--prune)
   fi
   $CONDA_TOOL env update \
-    --name "$ENV_NAME" --file "$ENV_FILE" \
+    --prefix "$ENV_PREFIX" --file "$ENV_FILE" \
     "${PRUNE_ARGS[@]}" "${ENV_EXTRA_ARGS[@]}"
 else
-  log "Creating conda env '$ENV_NAME' from $ENV_FILE"
+  log "Creating conda env at $ENV_PREFIX from $ENV_FILE"
   # Python is pinned inside environment.yml — passing it here as a positional
-  # spec is silently ignored by `env create` (only -n / -f are honoured) and
-  # would not affect the solver anyway.
+  # spec is silently ignored by `env create` (only --prefix / --file are
+  # honoured) and would not affect the solver anyway.
+  mkdir -p "$(dirname "$ENV_PREFIX")"
   $CONDA_TOOL env create \
-    --name "$ENV_NAME" --file "$ENV_FILE" \
+    --prefix "$ENV_PREFIX" --file "$ENV_FILE" \
     "${ENV_EXTRA_ARGS[@]}"
 fi
 
-log "Activating env '$ENV_NAME' ($ACTIVATE_CMD)"
-$ACTIVATE_CMD "$ENV_NAME"
+# Activation by prefix works the same way as by name for both conda and
+# mamba (1.x and 2.x).
+log "Activating env at $ENV_PREFIX ($ACTIVATE_CMD)"
+$ACTIVATE_CMD "$ENV_PREFIX"
 
 # Quick sanity checks on the tools the Python script depends on.
 for tool in osmium ogr2ogr cmake; do
@@ -195,11 +244,11 @@ cat <<EOF >&2
   Repo root  : $REPO_ROOT
   Build dir  : $BUILD_DIR  (binary: $BUILD_DIR/uwp)
   Data dir   : $DATA_DIR
-  Conda env  : $ENV_NAME
+  Env prefix : $ENV_PREFIX
 
 Next steps:
 
-  $ACTIVATE_CMD $ENV_NAME
+  $ACTIVATE_CMD $ENV_PREFIX
   python $REPO_ROOT/script/update_water_polygons.py --help
 
 EOF
