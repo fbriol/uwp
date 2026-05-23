@@ -63,6 +63,30 @@ try:
 except ImportError:
     _HAVE_CONTEXTILY = False
 
+# Default basemap provider. We intentionally do NOT default to
+# `OpenStreetMap.Mapnik`: the OSM tile server explicitly forbids scripted /
+# automated requests and rate-limits aggressively (HTTP 429 after a handful
+# of concurrent fetches). CartoDB Positron is built on the same data, has
+# the same coverage, looks comparable (cleaner even, neutral palette better
+# suited as a backdrop for overlays), and the CartoDB usage policy permits
+# automated use as long as it stays reasonable. Override with
+# `--basemap-provider` if you need a different look.
+_DEFAULT_BASEMAP_PROVIDER = 'CartoDB.Positron'
+
+# Catalogue of providers reachable via dotted names (e.g. "CartoDB.Positron"
+# → cx.providers.CartoDB.Positron). Resolved at call-time so a missing
+# provider in older contextily versions fails with a clear error rather
+# than at import.
+_BASEMAP_CHOICES = (
+    'CartoDB.Positron',
+    'CartoDB.Voyager',
+    'CartoDB.DarkMatter',
+    'OpenStreetMap.Mapnik',
+    'OpenStreetMap.HOT',
+    'Esri.WorldImagery',
+    'Esri.WorldTopoMap',
+)
+
 LOGGER = logging.getLogger(__name__)
 
 ROOT = pathlib.Path(__file__).parent.parent
@@ -177,6 +201,41 @@ def _prefilter_by_area(
         len(deltas),
     )
     return kept
+
+
+def _resolve_basemap_provider(name: str):
+    """Resolve a dotted provider name (e.g. 'CartoDB.Positron') to the
+    contextily provider object. Raises ValueError on unknown name so the
+    user gets a clear error instead of a cryptic AttributeError mid-render.
+    """
+    if not _HAVE_CONTEXTILY:
+        raise RuntimeError('contextily is not installed.')
+    obj = cx.providers
+    for part in name.split('.'):
+        try:
+            obj = getattr(obj, part)
+        except AttributeError as exc:
+            raise ValueError(
+                f'Unknown basemap provider {name!r}. '
+                f'Try one of: {", ".join(_BASEMAP_CHOICES)}'
+            ) from exc
+    return obj
+
+
+def _configure_basemap_cache(cache_dir: pathlib.Path) -> None:
+    """Point contextily at a shared on-disk cache so workers running in
+    parallel don't re-download the same tiles. With 32 workers hitting the
+    same provider, sharing a cache is what keeps us under any reasonable
+    rate limit on subsequent runs."""
+    if not _HAVE_CONTEXTILY:
+        return
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # contextily exposes `set_cache_dir` since 1.3. Older versions read
+    # the CONTEXTILY_CACHE env var.
+    if hasattr(cx, 'set_cache_dir'):
+        cx.set_cache_dir(str(cache_dir))
+    else:
+        os.environ['CONTEXTILY_CACHE'] = str(cache_dir)
 
 
 @contextlib.contextmanager
@@ -337,6 +396,53 @@ def cluster_deltas(
 # ---------------------------------------------------------------------------
 
 
+def _render_with_basemap(
+    ax,
+    ref_local: gpd.GeoDataFrame,
+    rev_local: gpd.GeoDataFrame,
+    cluster_deltas_gdf: gpd.GeoDataFrame,
+    extent_4326: tuple[float, float, float, float],
+    cluster_id: int,
+    basemap_provider: str,
+) -> None:
+    """Plot the reference/revised/delta layers in Web Mercator and overlay
+    a tile basemap. Basemap fetch is best-effort: tile servers occasionally
+    rate-limit (HTTP 429) or drop connections under concurrent load. We
+    don't want one failed cluster to abort the atlas — log and continue
+    with a blank background, the overlay is still meaningful on its own.
+    """
+    target_crs = 3857  # Web Mercator — required by contextily
+    ref_3857 = ref_local.to_crs(target_crs)
+    rev_3857 = rev_local.to_crs(target_crs)
+    delta_3857 = cluster_deltas_gdf.to_crs(target_crs)
+
+    ref_3857.boundary.plot(ax=ax, edgecolor='#1f77b4', linewidth=0.6, alpha=0.8)
+    rev_3857.boundary.plot(ax=ax, edgecolor='#d62728', linewidth=0.9, alpha=0.9)
+    delta_3857.plot(ax=ax, color='#ffdd44', alpha=0.55, edgecolor='#ff8c00')
+
+    minx, miny, maxx, maxy = extent_4326
+    extent_box_3857 = (
+        gpd.GeoSeries([box(minx, miny, maxx, maxy)], crs=4326)
+        .to_crs(target_crs)
+        .total_bounds
+    )
+    ax.set_xlim(extent_box_3857[0], extent_box_3857[2])
+    ax.set_ylim(extent_box_3857[1], extent_box_3857[3])
+    ax.set_aspect('equal')
+    try:
+        provider = _resolve_basemap_provider(basemap_provider)
+        cx.add_basemap(ax, source=provider, attribution_size=5)
+    except Exception as exc:
+        LOGGER.warning(
+            'Basemap fetch failed for cluster %d (provider=%s): %s',
+            cluster_id,
+            basemap_provider,
+            exc,
+        )
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
 def _render_cluster(
     cluster_id: int,
     cluster_deltas_gdf: gpd.GeoDataFrame,
@@ -345,6 +451,7 @@ def _render_cluster(
     output_path: pathlib.Path,
     dpi: int,
     with_basemap: bool,
+    basemap_provider: str = _DEFAULT_BASEMAP_PROVIDER,
 ) -> dict:
     """Render one cluster as a PNG and return metadata about it."""
     bounds = cluster_deltas_gdf.total_bounds
@@ -364,54 +471,15 @@ def _render_cluster(
     fig, ax = plt.subplots(figsize=(10, 10), dpi=dpi)
 
     if with_basemap and _HAVE_CONTEXTILY:
-        target_crs = 3857  # Web Mercator — required by contextily
-        ref_3857 = ref_local.to_crs(target_crs)
-        rev_3857 = rev_local.to_crs(target_crs)
-        delta_3857 = cluster_deltas_gdf.to_crs(target_crs)
-
-        ref_3857.boundary.plot(
-            ax=ax, edgecolor='#1f77b4', linewidth=0.6, alpha=0.8
+        _render_with_basemap(
+            ax,
+            ref_local,
+            rev_local,
+            cluster_deltas_gdf,
+            (extent_minx, extent_miny, extent_maxx, extent_maxy),
+            cluster_id,
+            basemap_provider,
         )
-        rev_3857.boundary.plot(
-            ax=ax, edgecolor='#d62728', linewidth=0.9, alpha=0.9
-        )
-        delta_3857.plot(
-            ax=ax,
-            color='#ffdd44',
-            alpha=0.55,
-            edgecolor='#ff8c00',
-        )
-
-        extent_box_3857 = (
-            gpd.GeoSeries(
-                [
-                    box(
-                        extent_minx,
-                        extent_miny,
-                        extent_maxx,
-                        extent_maxy,
-                    )
-                ],
-                crs=4326,
-            )
-            .to_crs(target_crs)
-            .total_bounds
-        )
-        ax.set_xlim(extent_box_3857[0], extent_box_3857[2])
-        ax.set_ylim(extent_box_3857[1], extent_box_3857[3])
-        ax.set_aspect('equal')
-        try:
-            cx.add_basemap(
-                ax,
-                source=cx.providers.OpenStreetMap.Mapnik,
-                attribution_size=5,
-            )
-        except Exception as exc:  # network / tile errors are not fatal
-            LOGGER.warning(
-                'Basemap fetch failed for cluster %d: %s', cluster_id, exc
-            )
-        ax.set_xticks([])
-        ax.set_yticks([])
     else:
         ref_local.boundary.plot(
             ax=ax,
@@ -604,8 +672,27 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--basemap',
         action='store_true',
-        help='Add an OSM basemap underneath (requires contextily and a '
-        'network connection to tile.openstreetmap.org).',
+        help='Add a basemap underneath each PNG (requires contextily and '
+        'network access to the tile provider).',
+    )
+    parser.add_argument(
+        '--basemap-provider',
+        default=_DEFAULT_BASEMAP_PROVIDER,
+        choices=_BASEMAP_CHOICES,
+        help='Tile provider for --basemap. Default is CartoDB.Positron '
+        '(scripted-use friendly, neutral palette). Avoid '
+        'OpenStreetMap.Mapnik for parallel runs: tile.openstreetmap.org '
+        'rate-limits aggressively and the OSM usage policy forbids '
+        'scripted bulk fetches.',
+    )
+    parser.add_argument(
+        '--basemap-cache-dir',
+        type=pathlib.Path,
+        default=pathlib.Path.home() / '.cache' / 'uwp-basemap-tiles',
+        help='Directory shared across workers to cache fetched basemap '
+        'tiles. Sharing a single cache avoids each worker independently '
+        're-downloading the same tiles — essential to stay under any tile '
+        'provider rate limit.',
     )
     parser.add_argument(
         '--max-images',
@@ -690,6 +777,8 @@ def _process_cell(
     dpi: int,
     with_basemap: bool,
     max_images: int,
+    basemap_provider: str = _DEFAULT_BASEMAP_PROVIDER,
+    basemap_cache_dir: pathlib.Path | None = None,
 ) -> list[dict]:
     """Worker: process one geohash-1 cell end-to-end.
 
@@ -707,6 +796,12 @@ def _process_cell(
         format=f'%(asctime)s - [cell {cell_id}] %(levelname)s - %(message)s',
         force=True,
     )
+
+    # Point contextily at the shared on-disk tile cache. Critical when
+    # running many workers in parallel: without it each worker would
+    # download the same tiles independently, triggering rate limits.
+    if with_basemap and basemap_cache_dir is not None:
+        _configure_basemap_cache(basemap_cache_dir)
 
     reference = gpd.read_file(reference_path, bbox=cell_bbox)
     revised = gpd.read_file(revised_path, bbox=cell_bbox)
@@ -749,6 +844,7 @@ def _process_cell(
                 png_dir / name,
                 dpi=dpi,
                 with_basemap=with_basemap,
+                basemap_provider=basemap_provider,
             )
             rec['cell'] = cell_id
             rendered.append(rec)
@@ -815,6 +911,14 @@ def main() -> None:
         args.max_images,
     )
 
+    # Make sure the basemap cache dir exists *before* spawning workers, so
+    # they don't race on `mkdir`. Touched by every worker via
+    # `_configure_basemap_cache`.
+    if args.basemap:
+        args.basemap_cache_dir.mkdir(parents=True, exist_ok=True)
+        # Configure for the parent process too, in case --parallel-cells=1.
+        _configure_basemap_cache(args.basemap_cache_dir)
+
     worker_kwargs = {
         'reference_path': args.reference,
         'revised_path': args.revised,
@@ -825,6 +929,8 @@ def main() -> None:
         'dpi': args.dpi,
         'with_basemap': args.basemap,
         'max_images': args.max_images,
+        'basemap_provider': args.basemap_provider,
+        'basemap_cache_dir': args.basemap_cache_dir,
     }
 
     all_records: list[dict] = []
