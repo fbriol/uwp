@@ -416,6 +416,17 @@ def _delete_shp_set(shp: pathlib.Path) -> None:
             sidecar.unlink()
 
 
+def _shp_age_days(shp_path: pathlib.Path) -> float:
+    """Age (in days) of the shapefile's mtime, or +inf if it's missing.
+    Used by the `--min-cache-age-days` throttle to decide whether a
+    region is worth re-extracting despite an upstream change."""
+    try:
+        mtime = shp_path.stat().st_mtime
+    except OSError:
+        return float('inf')
+    return (time.time() - mtime) / 86400.0
+
+
 def _delete_region_cache(region: str, sub_region: str) -> None:
     """Remove cached PBF + extracted intermediate PBF + extracted shapefile
     for a region. Called when upstream changed or when the user passes
@@ -443,7 +454,11 @@ def _metadata_matches(remote: dict, cached: dict) -> bool:
 
 
 def check_region_freshness(
-    region: str, sub_region: str, manifest: dict, force: bool = False
+    region: str,
+    sub_region: str,
+    manifest: dict,
+    force: bool = False,
+    min_cache_age_days: float = 0.0,
 ) -> tuple[bool, dict]:
     """Decide whether `region` needs (re-)downloading.
 
@@ -451,6 +466,11 @@ def check_region_freshness(
     so the caller can record it in the manifest once the refresh succeeds.
 
     - If `force` is set, always refresh.
+    - If `min_cache_age_days > 0`, skip the refresh when the local shapefile
+      is younger than this many days, *even if upstream changed*. Useful
+      for hot regions (Germany, France) that Geofabrik rebuilds daily —
+      avoids re-downloading + re-extracting just because a few hours of
+      edits accumulated upstream.
     - If upstream is unreachable, fall back to the cache: the run continues
       with whatever local data we have, and no manifest update is performed
       for that region.
@@ -462,9 +482,10 @@ def check_region_freshness(
         LOGGER.info('%s: --force → refresh', key)
         _delete_region_cache(region, sub_region)
         try:
-            return True, remote_metadata(url)
+            remote = remote_metadata(url)
         except (urllib.error.URLError, TimeoutError):
-            return True, {}
+            remote = {}
+        return True, remote
 
     try:
         remote = remote_metadata(url)
@@ -492,6 +513,26 @@ def check_region_freshness(
             remote.get('last_modified'),
         )
         return False, remote
+
+    # Throttle: even if upstream changed, skip the refresh when the local
+    # shapefile is younger than `min_cache_age_days`. Lets the user damp
+    # the refresh cadence of regions Geofabrik rebuilds aggressively
+    # (Germany, France, etc. rebuild ~daily).
+    if (
+        have_shp
+        and min_cache_age_days > 0
+        and _shp_age_days(shp) < min_cache_age_days
+    ):
+        LOGGER.info(
+            '%s: upstream changed but cache is %.1f days old '
+            '(< --min-cache-age-days=%g) — skipping',
+            key,
+            _shp_age_days(shp),
+            min_cache_age_days,
+        )
+        # Return False without updating remote: we don't want next run to
+        # think the cache matches upstream.
+        return False, {}
 
     if have_pbf and _metadata_matches(remote, cached) and not have_shp:
         # Manifest agrees with upstream and the source PBF is still on
@@ -819,6 +860,16 @@ def usage() -> argparse.Namespace:
         'from a corrupted cache.',
     )
     parser.add_argument(
+        '--min-cache-age-days',
+        type=float,
+        default=0.0,
+        help="Skip a region's refresh when its local shapefile is younger "
+        'than this many days, even if upstream changed. Lets you damp the '
+        'refresh cadence for regions Geofabrik rebuilds aggressively '
+        '(Germany / France / NL rebuild ~daily). 0 disables the throttle. '
+        'Typical values: 7 (weekly) or 30 (monthly).',
+    )
+    parser.add_argument(
         '--check-only',
         action='store_true',
         help='Print which regions would be refreshed and exit, without '
@@ -876,7 +927,10 @@ def _check_runtime_dependencies(uwp_path: str) -> None:
 
 
 def _plan_refresh(
-    selected_areas: tuple, manifest: dict, force: bool
+    selected_areas: tuple,
+    manifest: dict,
+    force: bool,
+    min_cache_age_days: float = 0.0,
 ) -> tuple[list[tuple[str, str]], dict[str, dict]]:
     """HEAD-poll Geofabrik for each selected region and return the list of
     regions that need refreshing together with their pending manifest
@@ -895,7 +949,11 @@ def _plan_refresh(
     regions_to_process: list[tuple[str, str]] = []
     for region, sub_region in candidates:
         needs_refresh, remote = check_region_freshness(
-            region, sub_region, manifest, force=force
+            region,
+            sub_region,
+            manifest,
+            force=force,
+            min_cache_age_days=min_cache_age_days,
         )
         if needs_refresh:
             regions_to_process.append((region, sub_region))
@@ -1053,8 +1111,7 @@ def _run_uwp(
         and shp_sub_region(region, sub_region).exists()
     ]
     LOGGER.info(
-        'Running %s on %d regional shapefile(s) '
-        '(max_inland_km=%g, patches=%s)',
+        'Running %s on %d regional shapefile(s) (max_inland_km=%g, patches=%s)',
         uwp_path,
         len(water_shapefiles),
         max_inland_km,
@@ -1097,7 +1154,10 @@ def main():
 
     manifest = load_manifest()
     regions_to_process, pending_metadata = _plan_refresh(
-        args.areas, manifest, force=args.force
+        args.areas,
+        manifest,
+        force=args.force,
+        min_cache_age_days=args.min_cache_age_days,
     )
 
     if args.check_only:
