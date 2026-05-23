@@ -13,19 +13,26 @@ channels:
   - conda-forge
 dependencies:
   # --- Python (script orchestration) -----------------------------------------
-  - python>=3.10
+  # IMPORTANT: pin python to a single minor version. Without it the solver
+  # explores every Python in the channel (3.9 → 3.13) and the search space
+  # blows up — env resolution on CNES went from ~30 min to ~1 min after this.
+  - python=3.13
 
   # --- C++ build toolchain ---------------------------------------------------
   # cxx-compiler installs gcc/g++ on Linux, clang on macOS, MSVC stub on
   # Windows — keeps the env file portable.
   - cxx-compiler
-  - cmake>=3.16
+  # Open ranges below are kept narrow on purpose: every `>=` line that is
+  # *not* pinned adds branches to the solver tree. Tighten further if env
+  # resolution is still slow.
+  - cmake>=3.31,<4
   - make
   - ninja
 
   # --- C++ libraries used by uwp --------------------------------------------
-  # CMakeLists requires Boost >= 1.79; conda-forge ships 1.84+.
-  - boost-cpp>=1.79
+  # CMakeLists requires Boost >= 1.79; pin to a current minor to keep the
+  # solver fast. Bump when needed.
+  - libboost-devel
   # shapelib is vendored under third_party/, so no conda package needed.
 
   # --- Runtime tools called by script/update_water_polygons.py --------------
@@ -35,7 +42,7 @@ dependencies:
   # --- QA / visualisation (script/visualize_diff.py) ------------------------
   # Pulls a few hundred MB of deps; install on workstations / QA nodes, skip
   # on minimal production deployments by removing this block.
-  - geopandas            # vector I/O + spatial joins on top of shapely/pyogrio
-  - matplotlib           # plotting backend
-  - contextily           # OSM basemap tiles (optional, used with --basemap)
-  - pyogrio              # fast shapefile reader (geopandas backend)
+  - geopandas=1.0.*      # vector I/O + spatial joins on top of shapely/pyogrio
+  - matplotlib-base=3.9.*  # plotting backend (skip the qt extras)
+  - contextily=1.6.*     # OSM basemap tiles (optional, used with --basemap)
+  - pyogrio=0.10.*       # fast shapefile reader (geopandas backend)

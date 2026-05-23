@@ -29,7 +29,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PYTHON_VERSION="3.13"
 
 ENV_NAME="${UWP_ENV_NAME:-uwp}"
 ENV_FILE="${UWP_ENV_FILE:-$REPO_ROOT/environment.yml}"
@@ -37,6 +36,12 @@ BUILD_DIR="${UWP_BUILD_DIR:-$REPO_ROOT/build}"
 DATA_DIR="${UWP_DATA_DIR:-$REPO_ROOT/data}"
 BUILD_TYPE="${UWP_BUILD_TYPE:-Release}"
 JOBS="${UWP_JOBS:-$(command -v nproc >/dev/null 2>&1 && nproc || echo 4)}"
+
+# Whether to pass --prune to `env update`. Pruning forces a full re-solve of
+# the dep graph (slow on CNES). Disabled by default for speed; set
+# UWP_PRUNE=1 if you removed a dependency from environment.yml and want it
+# uninstalled from the env.
+UWP_PRUNE="${UWP_PRUNE:-0}"
 
 log()  { printf '[init] %s\n' "$*" >&2; }
 die()  { printf '[init] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -113,12 +118,32 @@ fi
 # ----------------------------------------------------------------------------
 [[ -f "$ENV_FILE" ]] || die "Environment file not found: $ENV_FILE"
 
+ENV_EXTRA_ARGS=()
+# --strict-channel-priority: only consider packages from conda-forge (declared
+# in environment.yml). Eliminates conflict checks against the default channels
+# the solver would otherwise also explore — significant speed-up.
+if [[ "$CONDA_TOOL" == "mamba" ]] || [[ "$CONDA_TOOL" == "conda" ]]; then
+  ENV_EXTRA_ARGS+=(--strict-channel-priority)
+fi
+
 if $CONDA_TOOL env list | awk 'NR>2 {print $1}' | grep -qx "$ENV_NAME"; then
   log "Updating existing conda env '$ENV_NAME' from $ENV_FILE"
-  $CONDA_TOOL env update --name "$ENV_NAME" --file "$ENV_FILE" --prune
+  PRUNE_ARGS=()
+  if [[ "$UWP_PRUNE" == "1" ]]; then
+    log "UWP_PRUNE=1 → forcing full --prune re-solve (slower)"
+    PRUNE_ARGS+=(--prune)
+  fi
+  $CONDA_TOOL env update \
+    --name "$ENV_NAME" --file "$ENV_FILE" \
+    "${PRUNE_ARGS[@]}" "${ENV_EXTRA_ARGS[@]}"
 else
   log "Creating conda env '$ENV_NAME' from $ENV_FILE"
-  $CONDA_TOOL env create --name "$ENV_NAME" --file "$ENV_FILE" python=$PYTHON_VERSION
+  # Python is pinned inside environment.yml — passing it here as a positional
+  # spec is silently ignored by `env create` (only -n / -f are honoured) and
+  # would not affect the solver anyway.
+  $CONDA_TOOL env create \
+    --name "$ENV_NAME" --file "$ENV_FILE" \
+    "${ENV_EXTRA_ARGS[@]}"
 fi
 
 log "Activating env '$ENV_NAME' ($ACTIVATE_CMD)"
