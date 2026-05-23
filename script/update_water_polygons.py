@@ -637,6 +637,19 @@ def convert_to_shp(region: str, sub_region: str) -> None:
         ],
         check=True,
     )
+    # ogr2ogr `-where` filter: drop the water sub-types that are too narrow
+    # or too purely inland to contribute usefully to the coastline. Streams,
+    # canals, ditches and drains are typically modelled as long thin
+    # polygons that, if absorbed into the coast, drag it deep into the
+    # mainland (the "river going to Paris" pathology). Polygons without a
+    # `water=*` tag — most lakes, bays, lagoons — are kept (the
+    # `water IS NULL` clause).
+    excluded_water = ('stream', 'canal', 'ditch', 'drain')
+    where_clause = (
+        'water IS NULL OR water NOT IN ('
+        + ', '.join(f"'{w}'" for w in excluded_water)
+        + ')'
+    )
     subprocess.run(
         [
             'ogr2ogr',
@@ -645,6 +658,8 @@ def convert_to_shp(region: str, sub_region: str) -> None:
             f'{water_shp}',
             str(water_pbf),
             'multipolygons',
+            '-where',
+            where_clause,
         ],
         env=ogr_env,
         check=True,
@@ -769,6 +784,16 @@ def usage() -> argparse.Namespace:
         help='Maximum number of retry attempts for a single download or '
         'HEAD request before giving up. Exponential backoff with jitter '
         'is applied between attempts.',
+    )
+    parser.add_argument(
+        '--max-inland-km',
+        type=float,
+        default=0.0,
+        help='Maximum distance (in kilometres) a regional water polygon may '
+        'extend beyond the bounding box of the coastal water polygon it is '
+        'merged into. Anything farther is clipped — useful to stop river '
+        'polygons modelled as one giant feature from dragging the coastline '
+        'hundreds of km inland. 0 disables the cap. Typical values: 100-500.',
     )
     return parser.parse_args()
 
@@ -938,11 +963,16 @@ def _refresh_regions(
     )
 
 
-def _run_uwp(uwp_path: str, selected_areas: tuple) -> None:
+def _run_uwp(
+    uwp_path: str, selected_areas: tuple, max_inland_km: float = 0.0
+) -> None:
     """Initialise the working copy of the base water shapefile and invoke
     the C++ uwp binary on the full set of regional shapefiles that exist
     on disk for the selected areas. The merge phase always runs on the full
-    set because `bg::union_` is not invertible."""
+    set because `bg::union_` is not invertible.
+
+    `max_inland_km`: optional inland-distance cap forwarded to the binary
+    (0 disables it)."""
     target = initialize_working_directory()
     water_shapefiles = [
         str(shp_sub_region(region, sub_region))
@@ -951,14 +981,16 @@ def _run_uwp(uwp_path: str, selected_areas: tuple) -> None:
         and shp_sub_region(region, sub_region).exists()
     ]
     LOGGER.info(
-        'Running %s on %d regional shapefile(s)',
+        'Running %s on %d regional shapefile(s) (max_inland_km=%g)',
         uwp_path,
         len(water_shapefiles),
+        max_inland_km,
     )
-    subprocess.run(
-        [uwp_path, str(target), '-o', str(target), *water_shapefiles],
-        check=True,
-    )
+    cmd = [uwp_path, str(target), '-o', str(target)]
+    if max_inland_km > 0:
+        cmd += ['--max-inland-km', str(max_inland_km)]
+    cmd += water_shapefiles
+    subprocess.run(cmd, check=True)
     LOGGER.info('Done. Output: %s', target)
 
 
@@ -1009,7 +1041,7 @@ def main():
         # the regions that already succeeded.
         save_manifest(manifest)
 
-    _run_uwp(args.uwp, args.areas)
+    _run_uwp(args.uwp, args.areas, max_inland_km=args.max_inland_km)
 
 
 if __name__ == '__main__':
