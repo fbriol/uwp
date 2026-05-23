@@ -1,12 +1,83 @@
 
 #include "uwp/update.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <mutex>
 #include <unordered_map>
 
 #include "uwp/parallel_for.hpp"
 
 namespace uwp {
+
+// Approximate kilometres-per-degree of latitude (constant) and longitude
+// (latitude-dependent: shrinks by cos(latitude)). Good enough for an
+// inland-distance cap that is intentionally conservative.
+namespace {
+
+constexpr double KM_PER_DEG_LAT = 111.0;
+
+// Build a "cap box" from a water polygon's envelope, expanded by max_km
+// kilometres on every side. Longitude expansion uses cos(latitude_midpoint)
+// so the cap stays roughly metric even at high latitudes.
+//
+// `cos(lat)` is clamped to 0.01 (≈89.4°) to avoid the singularity at the
+// poles and keep the cap finite. Latitude is clamped to [-90, 90]; longitude
+// is wrapped to [-180, 180] only loosely — Boost.Geometry's intersection
+// handles oversized boxes gracefully because the input polygons stay within
+// [-180, 180].
+auto build_cap_box(const Box &envelope, double max_km) -> Box {
+  const double min_lon = bg::get<bg::min_corner, 0>(envelope);
+  const double min_lat = bg::get<bg::min_corner, 1>(envelope);
+  const double max_lon = bg::get<bg::max_corner, 0>(envelope);
+  const double max_lat = bg::get<bg::max_corner, 1>(envelope);
+
+  const double lat_mid = (min_lat + max_lat) * 0.5;
+  const double cos_lat = std::max(0.01, std::cos(lat_mid * M_PI / 180.0));
+
+  const double dlat = max_km / KM_PER_DEG_LAT;
+  const double dlon = max_km / (KM_PER_DEG_LAT * cos_lat);
+
+  return Box{Point{min_lon - dlon, std::max(-90.0, min_lat - dlat)},
+             Point{max_lon + dlon, std::min(90.0, max_lat + dlat)}};
+}
+
+// Apply the cap box to an area polygon and emit each resulting piece into
+// `out`. If max_inland_km <= 0 (cap disabled) or the area polygon fits
+// entirely inside the cap, the original polygon is emitted unchanged — no
+// intersection cost is paid.
+//
+// Intersection of a polygon and a box can produce zero, one, or many polygon
+// pieces (e.g. when a long river crosses the cap in two narrow places).
+// Multiple pieces share the same water_idx, so the downstream `groupby` will
+// merge them into the same union group.
+void emit_clipped_pieces(const Polygon &area_polygon, const Box &water_env,
+                         double max_inland_km, size_t water_idx,
+                         std::vector<std::pair<size_t, Polygon>> &out) {
+  if (max_inland_km <= 0.0) {
+    out.emplace_back(water_idx, area_polygon);
+    return;
+  }
+
+  const Box cap = build_cap_box(water_env, max_inland_km);
+  const Box area_env = bg::return_envelope<Box>(area_polygon);
+
+  // Cheap envelope check: if the area polygon is already inside the cap,
+  // skip the intersection entirely (covers the common case of small estuary
+  // polygons that don't extend far inland).
+  if (bg::covered_by(area_env, cap)) {
+    out.emplace_back(water_idx, area_polygon);
+    return;
+  }
+
+  std::vector<Polygon> clipped;
+  bg::intersection(area_polygon, cap, clipped);
+  for (auto &&piece : clipped) {
+    out.emplace_back(water_idx, std::move(piece));
+  }
+}
+
+}  // namespace
 
 // Inverted-loop helper: for each area polygon in [i0, i1), query the water
 // R-tree for candidate water polygons and record the first valid match.
@@ -18,11 +89,12 @@ namespace uwp {
 //
 // Assigning each area polygon to at most one water polygon preserves the
 // invariant the merge phase relies on: each water index appears in the
-// returned grouping at most once, so the merge can mutate water polygons
-// without cross-thread synchronization.
+// returned grouping at most once (after the post-loop groupby), so the merge
+// can mutate water polygons without cross-thread synchronization.
 inline auto select_overlap_local(const Shapefile &water_shp,
                                  const Shapefile::PolygonList &area,
-                                 const size_t i0, const size_t i1)
+                                 const size_t i0, const size_t i1,
+                                 double max_inland_km)
     -> std::vector<std::pair<size_t, Polygon>> {
   auto result = std::vector<std::pair<size_t, Polygon>>();
   result.reserve(i1 - i0);
@@ -54,8 +126,10 @@ inline auto select_overlap_local(const Shapefile &water_shp,
         continue;
       }
 
-      // Exclusive assignment: this area polygon belongs to `water_idx` only.
-      result.emplace_back(water_idx, area_polygon);
+      // Exclusive assignment: this area polygon (or its clipped pieces)
+      // belongs to `water_idx` only.
+      emit_clipped_pieces(area_polygon, candidate.first, max_inland_km,
+                          water_idx, result);
       break;
     }
   }
@@ -63,14 +137,14 @@ inline auto select_overlap_local(const Shapefile &water_shp,
 }
 
 auto select_overlap(const Shapefile &water_shp,
-                    const Shapefile::PolygonList &area)
+                    const Shapefile::PolygonList &area, double max_inland_km)
     -> std::vector<std::pair<size_t, std::vector<Polygon>>> {
   auto pairs = std::vector<std::pair<size_t, Polygon>>();
   auto mutex = std::mutex();
 
-  auto worker = [&water_shp, &area, &pairs, &mutex](const size_t i0,
-                                                    const size_t i1) {
-    auto local = select_overlap_local(water_shp, area, i0, i1);
+  auto worker = [&water_shp, &area, &pairs, &mutex, max_inland_km](
+                    const size_t i0, const size_t i1) {
+    auto local = select_overlap_local(water_shp, area, i0, i1, max_inland_km);
     if (local.empty()) {
       return;
     }
@@ -84,7 +158,8 @@ auto select_overlap(const Shapefile &water_shp,
 
   // Group matches by water polygon index. Each water index appears at most
   // once in the result so the merge phase can mutate water polygons without
-  // synchronization.
+  // synchronization. (A single area polygon clipped into multiple pieces all
+  // map to the same water_idx and end up in the same group.)
   std::unordered_map<size_t, std::vector<Polygon>> grouped;
   grouped.reserve(pairs.size());
   for (auto &&p : pairs) {

@@ -22,10 +22,16 @@ auto cascade_union(const std::vector<Polygon> &polygons)
 /// @param[in] water_shp The water shapefile (must have its R-tree built).
 /// @param[in] area     The list of area polygons to test against the water
 ///                     shapefile.
+/// @param[in] max_inland_km If > 0, each matched area polygon is clipped to
+///   the matched water polygon's envelope expanded by this many kilometres
+///   (degree approximation via cos(latitude)). Stops river polygons that
+///   extend hundreds of km inland from dragging the coastline along. 0
+///   disables the clip — preserves the historical behaviour.
 /// @return A list of `(water_index, area_polygons)` pairs — each water index
 ///         appears at most once.
 auto select_overlap(const Shapefile &water_shp,
-                    const Shapefile::PolygonList &area)
+                    const Shapefile::PolygonList &area,
+                    double max_inland_km = 0.0)
     -> std::vector<std::pair<size_t, std::vector<Polygon>>>;
 
 auto merge_overlapping(
