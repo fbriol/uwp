@@ -1,4 +1,5 @@
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -8,8 +9,9 @@
 int main(int argc, char* argv[]) {
   if (argc < 2) {
     std::cerr << "Usage: " << argv[0]
-              << " water_polygon [-o water_polygon_output] region_polygon1 "
-                 "[region_polygon2 ...]"
+              << " water_polygon [-o water_polygon_output]"
+                 " [--max-inland-km N]"
+                 " region_polygon1 [region_polygon2 ...]"
               << std::endl;
     return 1;
   }
@@ -22,11 +24,30 @@ int main(int argc, char* argv[]) {
   std::vector<std::string> region_files;
   bool output_specified = false;
 
+  // Inland-distance cap: regional water polygons extending more than this many
+  // kilometres beyond the matched coastal water polygon's envelope are clipped
+  // before merging. 0 disables the cap (default — preserves the original
+  // behaviour). Useful to prevent river polygons modelled as one giant feature
+  // from dragging the coastline hundreds of km inland.
+  double max_inland_km = 0.0;
+
   for (int i = 2; i < argc; ++i) {
     std::string arg = argv[i];
     if ((arg == "-o" || arg == "-O") && i + 1 < argc) {
       output_file = argv[++i];
       output_specified = true;
+    } else if (arg == "--max-inland-km" && i + 1 < argc) {
+      try {
+        max_inland_km = std::stod(argv[++i]);
+      } catch (const std::exception& exc) {
+        std::cerr << "Error: invalid --max-inland-km value: " << exc.what()
+                  << std::endl;
+        return 1;
+      }
+      if (max_inland_km < 0.0) {
+        std::cerr << "Error: --max-inland-km must be >= 0" << std::endl;
+        return 1;
+      }
     } else if (arg.length() > 1 && arg[0] == '-') {
       std::cerr << "Error: Unsupported option " << arg << std::endl;
       return 1;
@@ -46,6 +67,10 @@ int main(int argc, char* argv[]) {
     output_file = water_file + "_updated.shp";
   }
 
+  if (max_inland_km > 0.0) {
+    std::cout << "Inland-distance cap: " << max_inland_km << " km" << std::endl;
+  }
+
   // Load the water shapefile
   auto water_shp = uwp::Shapefile(water_file);
   water_shp.build_rtree_index();
@@ -58,7 +83,8 @@ int main(int argc, char* argv[]) {
 
     auto area_shp = uwp::Shapefile(region_file);
 
-    auto overlap = uwp::select_overlap(water_shp, *(area_shp.polygons()));
+    auto overlap =
+        uwp::select_overlap(water_shp, *(area_shp.polygons()), max_inland_km);
     uwp::merge_overlapping(water_shp, overlap);
   }
 
