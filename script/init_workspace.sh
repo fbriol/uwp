@@ -29,6 +29,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PYTHON_VERSION="3.13"
 
 ENV_NAME="${UWP_ENV_NAME:-uwp}"
 ENV_FILE="${UWP_ENV_FILE:-$REPO_ROOT/environment.yml}"
@@ -117,7 +118,7 @@ if $CONDA_TOOL env list | awk 'NR>2 {print $1}' | grep -qx "$ENV_NAME"; then
   $CONDA_TOOL env update --name "$ENV_NAME" --file "$ENV_FILE" --prune
 else
   log "Creating conda env '$ENV_NAME' from $ENV_FILE"
-  $CONDA_TOOL env create --name "$ENV_NAME" --file "$ENV_FILE"
+  $CONDA_TOOL env create --name "$ENV_NAME" --file "$ENV_FILE" python=$PYTHON_VERSION
 fi
 
 log "Activating env '$ENV_NAME' ($ACTIVATE_CMD)"
