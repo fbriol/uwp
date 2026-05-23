@@ -58,12 +58,16 @@ log "Using $CONDA_TOOL ($(command -v $CONDA_TOOL))"
 # etc. The cluster's outbound TLS interception breaks conda's SSL verification
 # against conda-forge, so we have to opt out there. Allow an explicit override
 # via UWP_DISABLE_SSL_VERIFY=1 for other environments behind similar proxies.
+#
+# Note: the `--ssl-verify` CLI flag is NOT accepted by the `env` subcommands
+# of conda/mamba (they are thin wrappers). The supported mechanism is the
+# CONDA_SSL_VERIFY environment variable, which the underlying conda library
+# reads for both `env create/update` and plain `install`.
 HOST_FQDN="$(hostname -f 2>/dev/null || hostname)"
-SSL_VERIFY_ARGS=()
 if [[ "${UWP_DISABLE_SSL_VERIFY:-0}" == "1" ]] \
    || [[ "$HOST_FQDN" == *.cnes.fr ]]; then
   log "Detected CNES host ($HOST_FQDN) — disabling SSL verification for $CONDA_TOOL"
-  SSL_VERIFY_ARGS=(--ssl-verify false)
+  export CONDA_SSL_VERIFY=false
 fi
 
 # Make 'conda activate' usable inside this non-interactive shell.
@@ -77,12 +81,10 @@ eval "$($CONDA_TOOL shell.bash hook)"
 
 if $CONDA_TOOL env list | awk 'NR>2 {print $1}' | grep -qx "$ENV_NAME"; then
   log "Updating existing conda env '$ENV_NAME' from $ENV_FILE"
-  $CONDA_TOOL env update --name "$ENV_NAME" --file "$ENV_FILE" --prune \
-    "${SSL_VERIFY_ARGS[@]}"
+  $CONDA_TOOL env update --name "$ENV_NAME" --file "$ENV_FILE" --prune
 else
   log "Creating conda env '$ENV_NAME' from $ENV_FILE"
-  $CONDA_TOOL env create --name "$ENV_NAME" --file "$ENV_FILE" \
-    "${SSL_VERIFY_ARGS[@]}"
+  $CONDA_TOOL env create --name "$ENV_NAME" --file "$ENV_FILE"
 fi
 
 log "Activating env '$ENV_NAME'"
