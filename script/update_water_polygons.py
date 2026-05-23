@@ -479,15 +479,31 @@ def check_region_freshness(
     cached = manifest.get(key, _MANIFEST_MISSING)
     pbf = osm_pbf_sub_region(region, sub_region)
     shp = shp_sub_region(region, sub_region)
-    have_local = pbf.exists() or shp.exists()
+    have_shp = shp.exists()
+    have_pbf = pbf.exists()
+    have_local = have_pbf or have_shp
 
-    if have_local and _metadata_matches(remote, cached):
+    if have_shp and _metadata_matches(remote, cached):
+        # Nominal case: both the shp and the manifest entry agree with
+        # upstream. Nothing to do.
         LOGGER.info(
             '%s: up to date (Last-Modified=%s)',
             key,
             remote.get('last_modified'),
         )
         return False, remote
+
+    if have_pbf and _metadata_matches(remote, cached) and not have_shp:
+        # Manifest agrees with upstream and the source PBF is still on
+        # disk, but the shapefile was deleted. Re-extract from the cached
+        # PBF — no need to re-download. The PBF is left in place: the
+        # downstream `download_sub_region` will short-circuit on it, and
+        # `convert_to_shp` will rebuild the shp from it.
+        LOGGER.info(
+            '%s: shapefile missing — re-extracting from cached PBF',
+            key,
+        )
+        return True, remote
 
     if cached is _MANIFEST_MISSING or not have_local:
         LOGGER.info('%s: first download', key)
