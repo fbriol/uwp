@@ -31,21 +31,30 @@ The script writes:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import html
 import logging
 import math
+import multiprocessing
+import os
 import pathlib
 import sys
 import warnings
 
 import geopandas as gpd
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import shapely
 from shapely.geometry import box
 from shapely.ops import unary_union
+
+# Workers render PNGs without an X server. Force the non-interactive backend
+# at import time so this works both in `main()` (single-process) and in
+# spawned multiprocessing workers.
+matplotlib.use('Agg')
 
 try:
     import contextily as cx
@@ -68,6 +77,47 @@ DEFAULT_OUTPUT = DATA_DIR / 'diff-report'
 # Approximate equirectangular conversion. Acceptable for area filtering and
 # bbox padding — we never use it for storing geometry.
 KM_PER_DEG_LAT = 111.0
+
+# Geohash base32 alphabet (no a, i, l, o). Each 1-char geohash cell encodes
+# 3 longitude bits (8 cells, 45° wide) and 2 latitude bits (4 cells, 45°
+# tall) → 32 cells covering the globe. Used to shard the diff computation
+# spatially so workers can process disjoint regions in parallel and only
+# load the polygons intersecting their cell (cheap with pyogrio's bbox
+# filter).
+_GEOHASH_BASE32 = '0123456789bcdefghjkmnpqrstuvwxyz'
+
+
+def _geohash1_bbox(char: str) -> tuple[float, float, float, float]:
+    """Return (minlon, minlat, maxlon, maxlat) for a 1-char geohash cell.
+
+    Bit interleaving: the 5 bits of a 1-char geohash are split lon, lat,
+    lon, lat, lon (most significant first). Decoding gives 3 lon bits
+    (8 cells) and 2 lat bits (4 cells).
+    """
+    idx = _GEOHASH_BASE32.index(char.lower())
+    bits = [(idx >> i) & 1 for i in range(4, -1, -1)]
+    lon_idx = (bits[0] << 2) | (bits[2] << 1) | bits[4]
+    lat_idx = (bits[1] << 1) | bits[3]
+    lon_step = 360.0 / 8
+    lat_step = 180.0 / 4
+    minlon = -180.0 + lon_idx * lon_step
+    minlat = -90.0 + lat_idx * lat_step
+    return (minlon, minlat, minlon + lon_step, minlat + lat_step)
+
+
+def _intersect_bboxes(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> tuple[float, float, float, float] | None:
+    """Intersection of two (minlon, minlat, maxlon, maxlat) tuples, or
+    None if disjoint."""
+    minlon = max(a[0], b[0])
+    minlat = max(a[1], b[1])
+    maxlon = min(a[2], b[2])
+    maxlat = min(a[3], b[3])
+    if minlon >= maxlon or minlat >= maxlat:
+        return None
+    return (minlon, minlat, maxlon, maxlat)
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +497,7 @@ _HTML_TEMPLATE = """<!doctype html>
 <p>{summary}</p>
 <table id="atlas">
 <thead><tr>
-  <th>#</th><th>Preview</th><th>Center</th>
+  <th>#</th><th>Cell</th><th>Preview</th><th>Center</th>
   <th>Added (km²)</th><th>Pieces</th><th>FIDs</th>
 </tr></thead>
 <tbody>
@@ -476,6 +526,7 @@ def _write_index(
         rows_html.append(
             '<tr>'
             f'<td>{rec["cluster_id"]}</td>'
+            f'<td><code>{html.escape(rec.get("cell", "?"))}</code></td>'
             f'<td><a href="{html.escape(img_rel)}">'
             f'<img src="{html.escape(img_rel)}" loading="lazy"></a></td>'
             f'<td>{rec["center_lat"]:+.4f}, {rec["center_lon"]:+.4f}</td>'
@@ -573,14 +624,16 @@ def _parse_args() -> argparse.Namespace:
         help='Restrict the diff to this geographic window. Speeds up '
         'inspection of a single region.',
     )
+    parser.add_argument(
+        '--parallel-cells',
+        type=int,
+        default=0,
+        help='Number of geohash-1 cells to process in parallel via '
+        'ProcessPoolExecutor. 0 = auto (cpu_count // 2). 1 = sequential '
+        '(useful for debugging). Each worker only loads the shapefile '
+        'slice intersecting its cell, so RAM usage stays bounded.',
+    )
     return parser.parse_args()
-
-
-def _load_clipped(path: pathlib.Path, bbox) -> gpd.GeoDataFrame:
-    LOGGER.info('Reading %s', path)
-    if bbox is not None:
-        return gpd.read_file(path, bbox=tuple(bbox))
-    return gpd.read_file(path)
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -598,24 +651,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         if not path.exists():
             LOGGER.error('%s not found: %s', label, path)
             sys.exit(1)
-
-
-def _load_inputs(
-    args: argparse.Namespace,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
-    """Load both shapefiles, applying the optional --bbox clip and
-    defaulting the CRS to EPSG:4326 when absent."""
-    reference = _load_clipped(args.reference, args.bbox)
-    revised = _load_clipped(args.revised, args.bbox)
-
-    if reference.crs is None or revised.crs is None:
-        LOGGER.warning(
-            'Missing CRS — assuming EPSG:4326. Set a .prj file to silence '
-            'this warning.'
-        )
-        reference = reference.set_crs(4326, allow_override=True)
-        revised = revised.set_crs(4326, allow_override=True)
-    return reference, revised
 
 
 def _rank_clusters(
@@ -643,43 +678,68 @@ def _rank_clusters(
     return candidates
 
 
-def _render_all_clusters(
-    clustered: gpd.GeoDataFrame,
-    reference: gpd.GeoDataFrame,
-    revised: gpd.GeoDataFrame,
-    args: argparse.Namespace,
+def _process_cell(
+    cell_id: str,
+    cell_bbox: tuple[float, float, float, float],
+    reference_path: pathlib.Path,
+    revised_path: pathlib.Path,
+    output_dir: pathlib.Path,
+    min_delta_km2: float,
+    cluster_buffer_km: float,
+    prefilter_km2: float,
+    dpi: int,
+    with_basemap: bool,
+    max_images: int,
 ) -> list[dict]:
-    """Rank clusters by area, render the top-N as PNGs, and return the
-    metadata records for the index file."""
-    rendered: list[dict] = []
-    png_dir = args.output / 'png'
+    """Worker: process one geohash-1 cell end-to-end.
 
-    candidates = _rank_clusters(clustered, args.min_delta_km2)
-    LOGGER.info(
-        '%d cluster(s) above %g km² threshold (of %d total)',
-        len(candidates),
-        args.min_delta_km2,
-        int(clustered['cluster_id'].max()) + 1,
+    Top-level (not a closure) so ProcessPoolExecutor can pickle it. Reads
+    only the polygons intersecting `cell_bbox` thanks to pyogrio's bbox
+    filter — each worker loads a small slice of the global shapefile
+    instead of the whole thing. Returns the list of rendered records
+    (each tagged with `cell`).
+    """
+    # ProcessPoolExecutor workers don't inherit the parent's logging setup
+    # when the start method is 'spawn' (macOS / Windows / 3.14+). Configure
+    # locally so log lines appear with their cell prefix.
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f'%(asctime)s - [cell {cell_id}] %(levelname)s - %(message)s',
+        force=True,
     )
-    if args.max_images and len(candidates) > args.max_images:
-        LOGGER.info(
-            'Rendering top %d by area (--max-images=%d). %d smaller '
-            'clusters skipped — raise --max-images or lower '
-            '--min-delta-km2 to see them.',
-            args.max_images,
-            args.max_images,
-            len(candidates) - args.max_images,
-        )
-        candidates = candidates[: args.max_images]
 
+    reference = gpd.read_file(reference_path, bbox=cell_bbox)
+    revised = gpd.read_file(revised_path, bbox=cell_bbox)
+    if reference.empty and revised.empty:
+        return []
+    if reference.crs is None:
+        reference = reference.set_crs(4326, allow_override=True)
+    if revised.crs is None:
+        revised = revised.set_crs(4326, allow_override=True)
+
+    deltas = find_deltas(reference, revised)
+    if deltas.empty:
+        return []
+
+    deltas = _prefilter_by_area(deltas, prefilter_km2)
+    if deltas.empty:
+        return []
+
+    clustered = cluster_deltas(deltas, cluster_buffer_km)
+    candidates = _rank_clusters(clustered, min_delta_km2)
+    if max_images and len(candidates) > max_images:
+        candidates = candidates[:max_images]
+
+    rendered: list[dict] = []
+    png_dir = output_dir / 'png'
     for cluster_id, _area, pieces, union in candidates:
-        # File name encodes location so it sorts geographically.
         centroid = union.centroid
+        # Cell prefix on the filename so we can spot the spatial origin at
+        # a glance and avoid name collisions across cells.
         name = (
-            f'cluster_{cluster_id:05d}_'
+            f'cell_{cell_id}_cluster_{cluster_id:05d}_'
             f'{centroid.y:+09.4f}_{centroid.x:+010.4f}.png'
         )
-
         try:
             rec = _render_cluster(
                 cluster_id,
@@ -687,73 +747,135 @@ def _render_all_clusters(
                 reference,
                 revised,
                 png_dir / name,
-                dpi=args.dpi,
-                with_basemap=args.basemap,
+                dpi=dpi,
+                with_basemap=with_basemap,
             )
+            rec['cell'] = cell_id
             rendered.append(rec)
-            if len(rendered) % 25 == 0:
-                LOGGER.info(
-                    'Rendered %d / %d clusters…',
-                    len(rendered),
-                    len(candidates),
-                )
         except Exception:
             LOGGER.exception(
-                'Failed rendering cluster %d, skipping', cluster_id
+                'Failed rendering cell %s cluster %d', cell_id, cluster_id
             )
+    LOGGER.info('Cell %s done: %d image(s)', cell_id, len(rendered))
     return rendered
+
+
+def _select_cells(
+    user_bbox: tuple[float, float, float, float] | None,
+) -> list[tuple[str, tuple[float, float, float, float]]]:
+    """Return the list of (cell_id, cell_bbox) to dispatch work to,
+    restricted to the cells intersecting --bbox when given."""
+    cells: list[tuple[str, tuple[float, float, float, float]]] = []
+    for ch in _GEOHASH_BASE32:
+        bbox = _geohash1_bbox(ch)
+        if user_bbox is not None:
+            bbox = _intersect_bboxes(bbox, user_bbox)
+            if bbox is None:
+                continue
+        cells.append((ch, bbox))
+    return cells
 
 
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
+        force=True,
     )
     args = _parse_args()
     _validate_args(args)
 
-    reference, revised = _load_inputs(args)
+    # Output directory shared by all workers.
+    (args.output / 'png').mkdir(parents=True, exist_ok=True)
 
-    LOGGER.info('Computing deltas…')
-    deltas = find_deltas(reference, revised)
-    if deltas.empty:
-        LOGGER.info('No deltas detected — nothing to render.')
-        return
-
-    # Pre-filter tiny pieces before the (expensive) clustering pass. Pieces
-    # 20x smaller than the cluster threshold still leave room to aggregate
-    # into a visible group, but the micro-artefacts (sub-km2 numerical
-    # leftovers from union) are dropped on the spot.
     prefilter_km2 = (
         args.prefilter_km2
         if args.prefilter_km2 is not None
         else args.min_delta_km2 / 20.0
     )
-    deltas = _prefilter_by_area(deltas, prefilter_km2)
-    if deltas.empty:
-        LOGGER.info('No deltas survived the pre-filter — nothing to render.')
-        return
 
-    LOGGER.info('Clustering %d delta pieces…', len(deltas))
-    clustered = cluster_deltas(deltas, args.cluster_buffer_km)
+    user_bbox = tuple(args.bbox) if args.bbox else None
+    cells = _select_cells(user_bbox)
 
-    rendered = _render_all_clusters(clustered, reference, revised, args)
-    if not rendered:
+    # Auto-pick a parallelism level: half the cores by default. Each worker
+    # spawns matplotlib + reads shapefiles, so over-subscribing hurts more
+    # than it helps. Capped at len(cells) — no point spawning idle workers.
+    parallel = args.parallel_cells
+    if parallel <= 0:
+        parallel = max(1, (os.cpu_count() or 2) // 2)
+    parallel = min(parallel, len(cells))
+
+    LOGGER.info(
+        'Processing %d geohash-1 cell(s) with %d worker(s) '
+        '(prefilter=%g km², min_delta=%g km², max_images/cell=%d)',
+        len(cells),
+        parallel,
+        prefilter_km2,
+        args.min_delta_km2,
+        args.max_images,
+    )
+
+    worker_kwargs = {
+        'reference_path': args.reference,
+        'revised_path': args.revised,
+        'output_dir': args.output,
+        'min_delta_km2': args.min_delta_km2,
+        'cluster_buffer_km': args.cluster_buffer_km,
+        'prefilter_km2': prefilter_km2,
+        'dpi': args.dpi,
+        'with_basemap': args.basemap,
+        'max_images': args.max_images,
+    }
+
+    all_records: list[dict] = []
+    if parallel == 1:
+        # Sequential fallback (useful for debugging / profiling).
+        for cell_id, cell_bbox in cells:
+            try:
+                all_records.extend(
+                    _process_cell(cell_id, cell_bbox, **worker_kwargs)
+                )
+            except Exception:
+                LOGGER.exception('Cell %s failed', cell_id)
+    else:
+        # 'spawn' start method avoids the pitfalls of forking after
+        # matplotlib / GEOS have initialised threads in the parent.
+        ctx = multiprocessing.get_context('spawn')
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=parallel, mp_context=ctx
+        ) as pool:
+            futures = {
+                pool.submit(
+                    _process_cell, cell_id, cell_bbox, **worker_kwargs
+                ): cell_id
+                for cell_id, cell_bbox in cells
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                cell_id = futures[fut]
+                try:
+                    all_records.extend(fut.result())
+                except Exception:
+                    LOGGER.exception('Cell %s failed', cell_id)
+
+    if not all_records:
         LOGGER.warning(
-            'No cluster met the --min-delta-km2=%g threshold.',
+            'No cluster met the --min-delta-km2=%g threshold across any cell.',
             args.min_delta_km2,
         )
         return
 
-    total_km2 = sum(r['added_km2'] for r in rendered)
+    total_km2 = sum(r['added_km2'] for r in all_records)
     summary = (
-        f'{len(rendered)} cluster(s) rendered '
+        f'{len(all_records)} cluster(s) rendered across '
+        f'{len(cells)} geohash-1 cell(s) '
         f'(total added: {total_km2:.2f} km²). '
         f'Source: <code>{html.escape(str(args.revised))}</code> vs '
         f'<code>{html.escape(str(args.reference))}</code>.'
     )
-    _write_index(args.output, rendered, summary)
-    LOGGER.info('Done. %d image(s) written to %s', len(rendered), args.output)
+    _write_index(args.output, all_records, summary)
+    LOGGER.info(
+        'Done. %d image(s) written to %s', len(all_records), args.output
+    )
 
 
 if __name__ == '__main__':
