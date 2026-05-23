@@ -24,6 +24,9 @@
 #   UWP_BUILD_TYPE — CMake build type          (default: Release)
 #   UWP_JOBS       — parallel build jobs       (default: nproc)
 #   UWP_PRUNE=1    — pass --prune to env update (slow; only when removing deps)
+#   UWP_SKIP_ENV=1 — skip the env create/update entirely; use the existing
+#                    env as-is and jump straight to the C++ build. Useful
+#                    when iterating on the build and the env hasn't changed.
 #   UWP_ALLOW_HOME_ENV=1
 #                  — bypass the safeguard that refuses to install the env
 #                    under $HOME. Only set if your $HOME has plenty of quota.
@@ -52,6 +55,12 @@ JOBS="${UWP_JOBS:-$(command -v nproc >/dev/null 2>&1 && nproc || echo 4)}"
 # UWP_PRUNE=1 if you removed a dependency from environment.yml and want it
 # uninstalled from the env.
 UWP_PRUNE="${UWP_PRUNE:-0}"
+
+# Skip the conda env create/update step entirely. Use when iterating on the
+# C++ build and you know the env hasn't changed. The env is still located
+# and activated so cmake picks up the right CC/CXX — only the (potentially
+# slow) `env update` call is bypassed. Set UWP_SKIP_ENV=1 to enable.
+UWP_SKIP_ENV="${UWP_SKIP_ENV:-0}"
 
 log()  { printf '[init] %s\n' "$*" >&2; }
 die()  { printf '[init] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -198,7 +207,16 @@ ENV_EXTRA_ARGS=()
 # An env at a specific prefix exists iff its conda-meta dir is populated.
 # `env list` doesn't always show prefix-based envs, so we check the path
 # directly — more reliable.
-if [[ -d "$ENV_PREFIX/conda-meta" ]]; then
+ENV_EXISTS=0
+[[ -d "$ENV_PREFIX/conda-meta" ]] && ENV_EXISTS=1
+
+if [[ "$UWP_SKIP_ENV" == "1" ]]; then
+  if [[ "$ENV_EXISTS" != "1" ]]; then
+    die "UWP_SKIP_ENV=1 but no env exists at $ENV_PREFIX.
+         Run once without UWP_SKIP_ENV to create the env first."
+  fi
+  log "UWP_SKIP_ENV=1 → skipping env create/update (using existing env at $ENV_PREFIX)"
+elif [[ "$ENV_EXISTS" == "1" ]]; then
   log "Updating existing conda env at $ENV_PREFIX from $ENV_FILE"
   PRUNE_ARGS=()
   if [[ "$UWP_PRUNE" == "1" ]]; then
