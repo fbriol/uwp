@@ -9,14 +9,24 @@
 #   4. Create the data directory layout used by script/update_water_polygons.py.
 #
 # Configuration via environment variables (all optional):
-#   UWP_ENV_NAME  — name of the conda env to create/update (default: uwp)
-#   UWP_ENV_FILE  — path to environment.yml (default: <repo>/environment.yml)
-#   UWP_BUILD_DIR — CMake build directory     (default: <repo>/build)
-#   UWP_DATA_DIR  — data root for downloads   (default: <repo>/data)
-#                   On the cluster, point this to scratch space, e.g.
-#                   UWP_DATA_DIR=/work/scratch/$USER/uwp-data
-#   UWP_BUILD_TYPE— CMake build type          (default: Release)
-#   UWP_JOBS      — parallel build jobs       (default: nproc)
+#   UWP_ENV_NAME   — name of the conda env (default: uwp). Only used to
+#                    derive the default UWP_ENV_PREFIX below.
+#   UWP_ENV_PREFIX — absolute path the env is installed into. Default:
+#                    "<mamba_install_root>/envs/$UWP_ENV_NAME" — keeps the
+#                    env *outside* $HOME so it doesn't fill up cluster
+#                    HOME quotas. Override only if you want the env in a
+#                    specific location.
+#   UWP_ENV_FILE   — path to environment.yml (default: <repo>/environment.yml)
+#   UWP_BUILD_DIR  — CMake build directory     (default: <repo>/build)
+#   UWP_DATA_DIR   — data root for downloads   (default: <repo>/data)
+#                    On the cluster, point this to scratch space, e.g.
+#                    UWP_DATA_DIR=/work/scratch/$USER/uwp-data
+#   UWP_BUILD_TYPE — CMake build type          (default: Release)
+#   UWP_JOBS       — parallel build jobs       (default: nproc)
+#   UWP_PRUNE=1    — pass --prune to env update (slow; only when removing deps)
+#   UWP_ALLOW_HOME_ENV=1
+#                  — bypass the safeguard that refuses to install the env
+#                    under $HOME. Only set if your $HOME has plenty of quota.
 #
 # Usage:
 #   ./script/init_workspace.sh
@@ -80,15 +90,29 @@ log "Using $CONDA_TOOL ($(command -v $CONDA_TOOL))"
 if [[ -n "${UWP_ENV_PREFIX:-}" ]]; then
   ENV_PREFIX="$UWP_ENV_PREFIX"
 else
-  # `$CONDA_TOOL info --base` prints the root install dir. Fall back to
-  # `dirname $(dirname $(which ...))` if `info --base` is unsupported
-  # (very old conda).
-  ROOT_PREFIX="$(
-    $CONDA_TOOL info --base 2>/dev/null \
-      || dirname "$(dirname "$(command -v "$CONDA_TOOL")")"
-  )"
+  # Auto-detect the mamba/conda root install prefix.
+  #
+  # We deliberately do NOT use `$CONDA_TOOL info --base` here: in mamba 2.x
+  # it prints descriptive text like " base environment : /path/to/root"
+  # instead of just the path, breaking the parse.
+  #
+  # The mamba/conda binary always lives at `<root>/bin/<tool>` (or
+  # `<root>/condabin/<tool>`), so stripping two path components from the
+  # resolved executable path gives us the root reliably across versions.
+  # `realpath` (or `readlink -f`) follows the symlinks installers commonly
+  # create (e.g. `~/.local/bin/mamba -> /opt/miniforge/bin/mamba`).
+  ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-${CONDA_ROOT:-}}"
+  if [[ -z "$ROOT_PREFIX" ]]; then
+    TOOL_PATH="$(command -v "$CONDA_TOOL")"
+    if command -v realpath >/dev/null 2>&1; then
+      TOOL_PATH="$(realpath "$TOOL_PATH")"
+    elif command -v readlink >/dev/null 2>&1; then
+      TOOL_PATH="$(readlink -f "$TOOL_PATH" 2>/dev/null || echo "$TOOL_PATH")"
+    fi
+    ROOT_PREFIX="$(dirname "$(dirname "$TOOL_PATH")")"
+  fi
   if [[ -z "$ROOT_PREFIX" ]] || [[ ! -d "$ROOT_PREFIX" ]]; then
-    die "Could not determine $CONDA_TOOL root prefix. Set UWP_ENV_PREFIX explicitly."
+    die "Could not determine $CONDA_TOOL root prefix ($ROOT_PREFIX). Set UWP_ENV_PREFIX explicitly."
   fi
   ENV_PREFIX="$ROOT_PREFIX/envs/$ENV_NAME"
 fi
