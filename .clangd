@@ -1,0 +1,14 @@
+CompileFlags:
+    Add:
+        - "-std=c++20"
+
+Diagnostics:
+    ClangTidy:
+        Add:
+            - boost-*
+            - concurrency-*
+            - modernize-*
+            - performance-*
+            - clang-analyzer-*
+            - portability-*
+            - google-*
