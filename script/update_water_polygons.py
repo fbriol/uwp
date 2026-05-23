@@ -588,6 +588,13 @@ def corrected_water_polygon_path() -> pathlib.Path:
     return DATA_DIR / 'corrected-water-polygons.shp'
 
 
+def patches_path() -> pathlib.Path:
+    """Path to the shapefile holding every polygon piece uwp added to the
+    coastline. Used by `script/visualize_patches.py` for fast QA — see
+    --patches-output flag and the corresponding C++ option."""
+    return DATA_DIR / 'patches.shp'
+
+
 def tmp_polygon_path() -> pathlib.Path:
     """Get the path to the corrected water polygons directory"""
     return DATA_DIR / 'tmp-water-polygons.shp'
@@ -836,6 +843,22 @@ def usage() -> argparse.Namespace:
         'polygons modelled as one giant feature from dragging the coastline '
         'hundreds of km inland. 0 disables the cap. Typical values: 100-500.',
     )
+    parser.add_argument(
+        '--patches-output',
+        type=pathlib.Path,
+        default=None,
+        help='Custom path for the patches shapefile (one feature per '
+        'polygon piece added to the coastline). Defaults to '
+        '<DATA_DIR>/patches.shp. Feeds the fast '
+        '`script/visualize_patches.py` QA tool.',
+    )
+    parser.add_argument(
+        '--no-patches',
+        action='store_true',
+        help='Skip writing the patches shapefile. The C++ binary then '
+        'runs without tracking — saves a small amount of memory on huge '
+        'datasets.',
+    )
     return parser.parse_args()
 
 
@@ -1005,15 +1028,23 @@ def _refresh_regions(
 
 
 def _run_uwp(
-    uwp_path: str, selected_areas: tuple, max_inland_km: float = 0.0
+    uwp_path: str,
+    selected_areas: tuple,
+    max_inland_km: float = 0.0,
+    patches_output: pathlib.Path | None = None,
 ) -> None:
     """Initialise the working copy of the base water shapefile and invoke
     the C++ uwp binary on the full set of regional shapefiles that exist
     on disk for the selected areas. The merge phase always runs on the full
     set because `bg::union_` is not invertible.
 
-    `max_inland_km`: optional inland-distance cap forwarded to the binary
-    (0 disables it)."""
+    Parameters:
+        max_inland_km: optional inland-distance cap forwarded to the binary
+            (0 disables it).
+        patches_output: if non-None, the binary writes the ground-truth
+            list of added polygon pieces to this shapefile (one feature per
+            piece). Consumed by `script/visualize_patches.py`.
+    """
     target = initialize_working_directory()
     water_shapefiles = [
         str(shp_sub_region(region, sub_region))
@@ -1022,17 +1053,24 @@ def _run_uwp(
         and shp_sub_region(region, sub_region).exists()
     ]
     LOGGER.info(
-        'Running %s on %d regional shapefile(s) (max_inland_km=%g)',
+        'Running %s on %d regional shapefile(s) '
+        '(max_inland_km=%g, patches=%s)',
         uwp_path,
         len(water_shapefiles),
         max_inland_km,
+        patches_output if patches_output else 'off',
     )
     cmd = [uwp_path, str(target), '-o', str(target)]
     if max_inland_km > 0:
         cmd += ['--max-inland-km', str(max_inland_km)]
+    if patches_output is not None:
+        patches_output.parent.mkdir(parents=True, exist_ok=True)
+        cmd += ['--patches-output', str(patches_output)]
     cmd += water_shapefiles
     subprocess.run(cmd, check=True)
     LOGGER.info('Done. Output: %s', target)
+    if patches_output is not None and patches_output.exists():
+        LOGGER.info('Patches written to: %s', patches_output)
 
 
 def main():
@@ -1082,7 +1120,20 @@ def main():
         # the regions that already succeeded.
         save_manifest(manifest)
 
-    _run_uwp(args.uwp, args.areas, max_inland_km=args.max_inland_km)
+    # Resolve the patches output path: user override > default > disabled.
+    if args.no_patches:
+        patches_out = None
+    elif args.patches_output is not None:
+        patches_out = args.patches_output
+    else:
+        patches_out = patches_path()
+
+    _run_uwp(
+        args.uwp,
+        args.areas,
+        max_inland_km=args.max_inland_km,
+        patches_output=patches_out,
+    )
 
 
 if __name__ == '__main__':
