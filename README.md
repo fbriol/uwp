@@ -194,4 +194,71 @@ python script/update_water_polygons.py --jobs 8 --extract-jobs 4
 
 # Recover from a corrupted cache
 python script/update_water_polygons.py --force --areas france
+
+# Truncate river polygons that extend more than 300 km inland
+python script/update_water_polygons.py --max-inland-km 300
 ```
+
+# QA: visual diff atlas
+
+For SWOT coastline calibration, every addition the pipeline made to the
+reference shapefile should be inspected. The companion script
+[`script/visualize_diff.py`](script/visualize_diff.py) renders a high-DPI
+PNG per modified region with an HTML atlas to navigate them.
+
+```bash
+python script/visualize_diff.py \
+    --reference data/water-polygons-split-4326/water_polygons.shp \
+    --revised  data/corrected-water-polygons.shp \
+    --output   data/diff-report \
+    --min-delta-km2 0.5 \
+    --basemap
+```
+
+The script:
+
+1. Pairs polygons by FID across the two shapefiles, computes
+   `revised[i] − reference[i]` for the modified ones, and picks up the
+   new polygons appended at the end of the revised file (the
+   `extra_polygons` produced by the C++ merge).
+2. **Clusters adjacent deltas geographically** (`--cluster-buffer-km`,
+   default 5 km) so a single estuary split across several base polygons
+   renders as one image rather than a dozen useless tiny ones.
+3. For each cluster, draws on a single PNG:
+   - blue outline: reference polygons in the area,
+   - red outline: revised polygons in the same area,
+   - yellow fill with orange border: the added zone(s),
+   - optional OSM basemap underneath when `--basemap` is set
+     (requires network).
+4. Writes `index.html` (sortable atlas of thumbnails) and
+   `clusters.csv` (machine-readable list with center coords, area added,
+   FIDs) under `--output`.
+
+| Option | Default | Description |
+|---|---|---|
+| `--reference` | `data/water-polygons-split-4326/water_polygons.shp` | Reference shapefile (pre-uwp). |
+| `--revised` | `data/corrected-water-polygons.shp` | Revised shapefile (uwp output). |
+| `--output` | `data/diff-report` | Output directory. |
+| `--min-delta-km2` | `0.1` | Skip clusters smaller than this — filters noise. |
+| `--cluster-buffer-km` | `5.0` | Merge adjacent deltas within this distance. |
+| `--dpi` | `200` | Output PNG resolution. 200 ≈ 1600×1600 px. |
+| `--basemap` | off | Add OSM tiles under the polygons (network required). |
+| `--max-images` | `0` (unlimited) | Cap the render count — for a quick sanity check. |
+| `--bbox MINLON MINLAT MAXLON MAXLAT` | none | Restrict the diff to a window — much faster when inspecting one region. |
+
+### Typical workflow
+
+```bash
+# After a full pipeline run, generate the QA atlas with basemap:
+python script/visualize_diff.py --basemap --min-delta-km2 0.5
+
+# Quick look at one area only:
+python script/visualize_diff.py --bbox -2 43 2 47 --basemap
+
+# Top-20 biggest additions only, no basemap (offline):
+python script/visualize_diff.py --max-images 20 --min-delta-km2 1.0
+```
+
+Then open `data/diff-report/index.html` in a browser. Rows are sorted by
+added area (descending), so the biggest changes — the most likely to
+need a human eyeball — appear first.
