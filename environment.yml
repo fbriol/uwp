@@ -31,3 +31,11 @@ dependencies:
   # --- Runtime tools called by script/update_water_polygons.py --------------
   - osmium-tool          # extracts natural=water features from OSM PBF
   - gdal                 # provides ogr2ogr to convert to ESRI Shapefile
+
+  # --- QA / visualisation (script/visualize_diff.py) ------------------------
+  # Pulls a few hundred MB of deps; install on workstations / QA nodes, skip
+  # on minimal production deployments by removing this block.
+  - geopandas            # vector I/O + spatial joins on top of shapely/pyogrio
+  - matplotlib           # plotting backend
+  - contextily           # OSM basemap tiles (optional, used with --basemap)
+  - pyogrio              # fast shapefile reader (geopandas backend)
