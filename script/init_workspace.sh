@@ -70,9 +70,24 @@ if [[ "${UWP_DISABLE_SSL_VERIFY:-0}" == "1" ]] \
   export CONDA_SSL_VERIFY=false
 fi
 
-# Make 'conda activate' usable inside this non-interactive shell.
-# shellcheck disable=SC1090
-eval "$($CONDA_TOOL shell.bash hook)"
+# Make `<tool> activate` usable inside this non-interactive shell. The hook
+# command syntax changed between mamba 1.x and mamba 2.x:
+#   - conda (any version): `conda shell.bash hook`
+#   - mamba 1.x:           `mamba shell.bash hook`   (legacy, conda-compatible)
+#   - mamba 2.x:           `mamba shell hook --shell bash` (new syntax)
+# We try the new mamba-2 syntax first when applicable, then fall back to the
+# legacy one. The eval'd output defines the activate function we need.
+ACTIVATE_CMD="$CONDA_TOOL activate"
+if [[ "$CONDA_TOOL" == "mamba" ]] \
+   && mamba shell hook --shell bash >/dev/null 2>&1; then
+  # mamba 2.x
+  # shellcheck disable=SC1090
+  eval "$(mamba shell hook --shell bash)"
+else
+  # conda, or mamba 1.x
+  # shellcheck disable=SC1090
+  eval "$($CONDA_TOOL shell.bash hook)"
+fi
 
 # ----------------------------------------------------------------------------
 # 2. Create or update the env
@@ -87,8 +102,8 @@ else
   $CONDA_TOOL env create --name "$ENV_NAME" --file "$ENV_FILE"
 fi
 
-log "Activating env '$ENV_NAME'"
-$CONDA_TOOL activate "$ENV_NAME"
+log "Activating env '$ENV_NAME' ($ACTIVATE_CMD)"
+$ACTIVATE_CMD "$ENV_NAME"
 
 # Quick sanity checks on the tools the Python script depends on.
 for tool in osmium ogr2ogr cmake; do
@@ -140,7 +155,7 @@ cat <<EOF >&2
 
 Next steps:
 
-  $CONDA_TOOL activate $ENV_NAME
+  $ACTIVATE_CMD $ENV_NAME
   python $REPO_ROOT/script/update_water_polygons.py --help
 
 EOF
