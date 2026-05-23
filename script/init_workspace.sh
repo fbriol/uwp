@@ -233,6 +233,25 @@ done
 # ----------------------------------------------------------------------------
 # 3. Configure and build the C++ binary
 # ----------------------------------------------------------------------------
+# Invalidate the CMake cache if it references compilers from an env that no
+# longer exists (typical after moving the env prefix — e.g. relocating from
+# ~/.conda/envs/uwp to <mamba_root>/envs/uwp). CMake's cached
+# CMAKE_C_COMPILER / CMAKE_CXX_COMPILER paths point absolutely into the env
+# bin dir; if those files vanished, every subsequent configure errors with
+# "is not a full path to an existing compiler tool". Wiping the cache makes
+# CMake rediscover the active env's compilers via the CC / CXX env vars set
+# by conda activation.
+if [[ -f "$BUILD_DIR/CMakeCache.txt" ]]; then
+  CACHED_CXX="$(
+    awk -F= '/^CMAKE_CXX_COMPILER:/ {print $2; exit}' \
+      "$BUILD_DIR/CMakeCache.txt"
+  )"
+  if [[ -n "$CACHED_CXX" ]] && [[ ! -x "$CACHED_CXX" ]]; then
+    log "Stale CMake cache (compiler $CACHED_CXX missing). Wiping $BUILD_DIR."
+    rm -rf "$BUILD_DIR"
+  fi
+fi
+
 log "Configuring CMake (build type: $BUILD_TYPE) in $BUILD_DIR"
 cmake -S "$REPO_ROOT" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
 
