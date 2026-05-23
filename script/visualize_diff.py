@@ -31,15 +31,19 @@ The script writes:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import html
 import logging
 import math
 import pathlib
 import sys
+import warnings
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+import shapely
 from shapely.geometry import box
 from shapely.ops import unary_union
 
@@ -90,6 +94,60 @@ def _km_to_deg(km: float, lat_mid: float) -> float:
     return km / (KM_PER_DEG_LAT * cos_lat)
 
 
+def _prefilter_by_area(
+    deltas: gpd.GeoDataFrame, min_km2: float
+) -> gpd.GeoDataFrame:
+    """Drop delta pieces whose individual area is below `min_km2`.
+
+    Run *before* clustering: buffer + unary_union scale with N², so
+    pruning the long tail of micro-pieces (sub-km² artefacts from union
+    rounding) before clustering is the single biggest perf lever.
+    Pieces just below the per-cluster threshold can still cluster
+    together if there are enough of them — that's why this prefilter
+    threshold should be much smaller than --min-delta-km2.
+    """
+    if min_km2 <= 0 or deltas.empty:
+        return deltas
+    with _suppress_geographic_crs_warning():
+        # Per-piece area approximation via shapely (cheap) + lat-aware
+        # cos correction at the piece centroid latitude.
+        centroids_y = deltas.geometry.centroid.y.values
+    areas_deg2 = deltas.geometry.area.values
+    km2 = (
+        areas_deg2
+        * (KM_PER_DEG_LAT**2)
+        * np.abs(np.cos(np.radians(centroids_y)))
+    )
+    keep = km2 >= min_km2
+    kept = deltas.loc[keep].reset_index(drop=True)
+    LOGGER.info(
+        'Pre-filter ≥ %g km²: kept %d / %d delta pieces',
+        min_km2,
+        len(kept),
+        len(deltas),
+    )
+    return kept
+
+
+@contextlib.contextmanager
+def _suppress_geographic_crs_warning():
+    """Silence geopandas' "Geometry is in a geographic CRS" warning.
+
+    We intentionally do `centroid` / `buffer` on EPSG:4326 geometries for
+    cheap clustering. The geometric error this introduces is irrelevant
+    for grouping pieces by proximity — we only need the partition to be
+    stable, not metrically exact. Wrap the relevant calls in this CM so
+    the warning doesn't drown the script's actual log lines.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            'ignore',
+            message='Geometry is in a geographic CRS',
+            category=UserWarning,
+        )
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Delta detection
 # ---------------------------------------------------------------------------
@@ -121,21 +179,37 @@ def find_deltas(
     rev_geoms = revised.geometry.values
     common = min(n_ref, n_rev)
 
-    rows: list[dict] = []
-
-    # Fast path: skip polygons whose envelope is unchanged. Catches the
+    # Step 1: cheap envelope test, vectorised in numpy. Catches the
     # overwhelming majority of records since the diff only touches a few
-    # thousand polygons globally.
+    # thousand polygons out of ~50-100k.
     ref_bounds = reference.bounds.values
     rev_bounds = revised.bounds.values
+    changed_mask = np.any(ref_bounds[:common] != rev_bounds[:common], axis=1)
+    changed_fids = np.flatnonzero(changed_mask)
+    LOGGER.info(
+        'Envelope-changed candidates: %d / %d', len(changed_fids), common
+    )
 
-    for fid in range(common):
-        if (ref_bounds[fid] == rev_bounds[fid]).all():
-            continue
-        delta = rev_geoms[fid].difference(ref_geoms[fid])
-        if delta.is_empty:
-            continue
-        rows.append({'fid': fid, 'kind': 'modified', 'geometry': delta})
+    # Step 2: batch-compute the geometric differences with shapely 2.x's
+    # vectorised API. One call into GEOS for the lot rather than ~40k
+    # per-polygon Python round-trips. Drops this step from minutes to
+    # seconds on large diffs.
+    if len(changed_fids) > 0:
+        deltas_arr = shapely.difference(
+            rev_geoms[changed_fids], ref_geoms[changed_fids]
+        )
+        non_empty = ~shapely.is_empty(deltas_arr)
+        kept_fids = changed_fids[non_empty]
+        kept_geoms = deltas_arr[non_empty]
+    else:
+        kept_fids = np.empty(0, dtype=int)
+        kept_geoms = np.empty(0, dtype=object)
+    LOGGER.info('Modified deltas with non-empty geometry: %d', len(kept_fids))
+
+    rows: list[dict] = [
+        {'fid': int(fid), 'kind': 'modified', 'geometry': geom}
+        for fid, geom in zip(kept_fids, kept_geoms, strict=True)
+    ]
 
     # Polygons appended at the end of the revised file.
     rows.extend(
@@ -170,34 +244,39 @@ def cluster_deltas(
         deltas['cluster_id'] = []
         return deltas
 
-    # Use the global centroid latitude for the buffer-radius conversion.
-    # Good enough — we only need clusters, not metric exactness.
-    centroid_lats = deltas.geometry.centroid.y
-    lat_mid = float(centroid_lats.mean())
-    buffer_deg = _km_to_deg(buffer_km / 2, lat_mid)
+    # All the centroid/buffer calls below run on EPSG:4326 geometries on
+    # purpose — see `_suppress_geographic_crs_warning` for the rationale.
+    with _suppress_geographic_crs_warning():
+        # Use the global centroid latitude for the buffer-radius conversion.
+        # Good enough — we only need clusters, not metric exactness.
+        centroid_lats = deltas.geometry.centroid.y
+        lat_mid = float(centroid_lats.mean())
+        buffer_deg = _km_to_deg(buffer_km / 2, lat_mid)
 
-    buffered = deltas.geometry.buffer(buffer_deg)
-    dissolved = unary_union(buffered.values)
-    components = (
-        [dissolved]
-        if dissolved.geom_type == 'Polygon'
-        else list(dissolved.geoms)
-    )
+        buffered = deltas.geometry.buffer(buffer_deg)
+        dissolved = unary_union(buffered.values)
+        components = (
+            [dissolved]
+            if dissolved.geom_type == 'Polygon'
+            else list(dissolved.geoms)
+        )
 
-    cluster_gdf = gpd.GeoDataFrame(
-        {'cluster_id': range(len(components))},
-        geometry=components,
-        crs=deltas.crs,
-    )
+        cluster_gdf = gpd.GeoDataFrame(
+            {'cluster_id': range(len(components))},
+            geometry=components,
+            crs=deltas.crs,
+        )
 
-    # Spatial join: each delta picks up the cluster_id of the component
-    # that contains its centroid.
-    centroids = gpd.GeoDataFrame(
-        deltas.drop(columns='geometry'),
-        geometry=deltas.geometry.centroid,
-        crs=deltas.crs,
-    )
-    joined = gpd.sjoin(centroids, cluster_gdf, how='left', predicate='within')
+        # Spatial join: each delta picks up the cluster_id of the component
+        # that contains its centroid.
+        centroids = gpd.GeoDataFrame(
+            deltas.drop(columns='geometry'),
+            geometry=deltas.geometry.centroid,
+            crs=deltas.crs,
+        )
+        joined = gpd.sjoin(
+            centroids, cluster_gdf, how='left', predicate='within'
+        )
     deltas = deltas.copy()
     deltas['cluster_id'] = joined['cluster_id'].astype('Int64').values
     return deltas
@@ -443,9 +522,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--min-delta-km2',
         type=float,
-        default=0.1,
+        default=1.0,
         help='Skip clusters whose total added area is below this threshold. '
-        'Filters out micro-additions that would clutter the atlas.',
+        'Filters out micro-additions that would clutter the atlas. The '
+        'previous default (0.1) was too noisy on global datasets.',
     )
     parser.add_argument(
         '--cluster-buffer-km',
@@ -453,6 +533,16 @@ def _parse_args() -> argparse.Namespace:
         default=5.0,
         help='Maximum distance between delta pieces for them to be grouped '
         'into the same image. Larger = fewer, bigger images.',
+    )
+    parser.add_argument(
+        '--prefilter-km2',
+        type=float,
+        default=None,
+        help='Drop individual delta pieces smaller than this BEFORE the '
+        'expensive clustering step. Massive speed-up on global diffs '
+        '(40k+ pieces → a few hundred). Default: --min-delta-km2 / 20, '
+        'so 20 sub-threshold pieces could still cluster together. Set to '
+        '0 to disable.',
     )
     parser.add_argument(
         '--dpi',
@@ -469,9 +559,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--max-images',
         type=int,
-        default=0,
-        help='Cap the number of images rendered (0 = unlimited). Useful '
-        'for a quick sanity-check pass.',
+        default=200,
+        help='Cap the number of images rendered (0 = unlimited). The default '
+        'gives a manageable atlas; raise it if you need exhaustive QA. '
+        'Clusters are ranked by area so the most impactful ones are kept.',
     )
     parser.add_argument(
         '--bbox',
@@ -527,31 +618,61 @@ def _load_inputs(
     return reference, revised
 
 
+def _rank_clusters(
+    clustered: gpd.GeoDataFrame, min_delta_km2: float
+) -> list[tuple[int, float, gpd.GeoDataFrame, object]]:
+    """Compute (cluster_id, area_km2, pieces, union) for every cluster,
+    drop those below the threshold, and return them sorted by area
+    descending. Doing this *before* the render loop lets us cap the work
+    at --max-images by area rather than by encounter order — biggest
+    additions get rendered first, the rest are skipped."""
+    cluster_count = int(clustered['cluster_id'].max()) + 1
+    candidates: list[tuple[int, float, gpd.GeoDataFrame, object]] = []
+    for cluster_id in range(cluster_count):
+        pieces = clustered[clustered['cluster_id'] == cluster_id]
+        if pieces.empty:
+            continue
+        with _suppress_geographic_crs_warning():
+            lat_mid = float(pieces.geometry.centroid.y.mean())
+        union = unary_union(pieces.geometry.values)
+        area = _area_km2(union, lat_mid)
+        if area < min_delta_km2:
+            continue
+        candidates.append((cluster_id, area, pieces, union))
+    candidates.sort(key=lambda x: -x[1])
+    return candidates
+
+
 def _render_all_clusters(
     clustered: gpd.GeoDataFrame,
     reference: gpd.GeoDataFrame,
     revised: gpd.GeoDataFrame,
     args: argparse.Namespace,
 ) -> list[dict]:
-    """Iterate over clusters, filter by area, render each as a PNG, and
-    return the metadata records for the index file."""
+    """Rank clusters by area, render the top-N as PNGs, and return the
+    metadata records for the index file."""
     rendered: list[dict] = []
-    cluster_count = int(clustered['cluster_id'].max()) + 1
     png_dir = args.output / 'png'
 
-    for cluster_id in range(cluster_count):
-        cluster_pieces = clustered[clustered['cluster_id'] == cluster_id]
-        if cluster_pieces.empty:
-            continue
-        lat_mid = float(cluster_pieces.geometry.centroid.y.mean())
-        union = unary_union(cluster_pieces.geometry.values)
-        if _area_km2(union, lat_mid) < args.min_delta_km2:
-            continue
+    candidates = _rank_clusters(clustered, args.min_delta_km2)
+    LOGGER.info(
+        '%d cluster(s) above %g km² threshold (of %d total)',
+        len(candidates),
+        args.min_delta_km2,
+        int(clustered['cluster_id'].max()) + 1,
+    )
+    if args.max_images and len(candidates) > args.max_images:
+        LOGGER.info(
+            'Rendering top %d by area (--max-images=%d). %d smaller '
+            'clusters skipped — raise --max-images or lower '
+            '--min-delta-km2 to see them.',
+            args.max_images,
+            args.max_images,
+            len(candidates) - args.max_images,
+        )
+        candidates = candidates[: args.max_images]
 
-        if args.max_images and len(rendered) >= args.max_images:
-            LOGGER.info('Reached --max-images=%d, stopping.', args.max_images)
-            break
-
+    for cluster_id, _area, pieces, union in candidates:
         # File name encodes location so it sorts geographically.
         centroid = union.centroid
         name = (
@@ -562,7 +683,7 @@ def _render_all_clusters(
         try:
             rec = _render_cluster(
                 cluster_id,
-                cluster_pieces,
+                pieces,
                 reference,
                 revised,
                 png_dir / name,
@@ -571,7 +692,11 @@ def _render_all_clusters(
             )
             rendered.append(rec)
             if len(rendered) % 25 == 0:
-                LOGGER.info('Rendered %d clusters…', len(rendered))
+                LOGGER.info(
+                    'Rendered %d / %d clusters…',
+                    len(rendered),
+                    len(candidates),
+                )
         except Exception:
             LOGGER.exception(
                 'Failed rendering cluster %d, skipping', cluster_id
@@ -595,7 +720,21 @@ def main() -> None:
         LOGGER.info('No deltas detected — nothing to render.')
         return
 
-    LOGGER.info('Found %d raw delta pieces. Clustering…', len(deltas))
+    # Pre-filter tiny pieces before the (expensive) clustering pass. Pieces
+    # 20x smaller than the cluster threshold still leave room to aggregate
+    # into a visible group, but the micro-artefacts (sub-km2 numerical
+    # leftovers from union) are dropped on the spot.
+    prefilter_km2 = (
+        args.prefilter_km2
+        if args.prefilter_km2 is not None
+        else args.min_delta_km2 / 20.0
+    )
+    deltas = _prefilter_by_area(deltas, prefilter_km2)
+    if deltas.empty:
+        LOGGER.info('No deltas survived the pre-filter — nothing to render.')
+        return
+
+    LOGGER.info('Clustering %d delta pieces…', len(deltas))
     clustered = cluster_deltas(deltas, args.cluster_buffer_km)
 
     rendered = _render_all_clusters(clustered, reference, revised, args)
