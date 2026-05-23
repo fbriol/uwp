@@ -402,6 +402,11 @@ def save_manifest(manifest: dict) -> None:
     with tmp.open('w') as f:
         json.dump(manifest, f, indent=2, sort_keys=True)
     tmp.replace(MANIFEST_PATH)
+    LOGGER.info(
+        'Manifest saved to %s (%d entries)',
+        MANIFEST_PATH,
+        len(manifest),
+    )
 
 
 def _manifest_key(region: str, sub_region: str) -> str:
@@ -989,9 +994,20 @@ def _refresh_regions_parallel(
     """
 
     def _commit(region: str, sub_region: str) -> None:
-        meta = pending_metadata.get(_manifest_key(region, sub_region))
+        key = _manifest_key(region, sub_region)
+        meta = pending_metadata.get(key)
         if meta:
             record_region_metadata(manifest, region, sub_region, meta)
+            LOGGER.info(
+                '%s: manifest committed (Last-Modified=%s)',
+                key,
+                meta.get('last_modified'),
+            )
+        else:
+            LOGGER.warning(
+                '%s: skipped manifest commit — no pending metadata',
+                key,
+            )
 
     # Threads (not processes): work is dominated by subprocess.run and
     # urllib I/O, which both release the GIL.
@@ -1013,8 +1029,17 @@ def _refresh_regions_parallel(
             ex_future = extract_pool.submit(convert_to_shp, region, sub_region)
 
             def _on_extract_done(fut: concurrent.futures.Future) -> None:
-                if fut.exception() is None:
+                key = _manifest_key(region, sub_region)
+                exc = fut.exception()
+                if exc is None:
                     _commit(region, sub_region)
+                else:
+                    LOGGER.warning(
+                        '%s: extract callback saw exception %s — '
+                        'manifest NOT committed',
+                        key,
+                        type(exc).__name__,
+                    )
 
             ex_future.add_done_callback(_on_extract_done)
             return ex_future
@@ -1071,9 +1096,20 @@ def _refresh_regions(
         for region, sub_region in regions_to_process:
             download_sub_region(region, sub_region)
             convert_to_shp(region, sub_region)
-            meta = pending_metadata.get(_manifest_key(region, sub_region))
+            key = _manifest_key(region, sub_region)
+            meta = pending_metadata.get(key)
             if meta:
                 record_region_metadata(manifest, region, sub_region, meta)
+                LOGGER.info(
+                    '%s: manifest committed (Last-Modified=%s)',
+                    key,
+                    meta.get('last_modified'),
+                )
+            else:
+                LOGGER.warning(
+                    '%s: skipped manifest commit — no pending metadata',
+                    key,
+                )
         return
 
     _refresh_regions_parallel(
