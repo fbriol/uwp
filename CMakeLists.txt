@@ -26,6 +26,14 @@ find_package(Boost 1.79 REQUIRED filesystem)
 include_directories(${Boost_INCLUDE_DIRS})
 add_definitions(-DBOOST_FILESYSTEM_VERSION=4)
 
+# std::thread requires linking against the platform threading library. On
+# Linux/GCC this resolves to -pthread (libpthread). macOS/clang doesn't need an
+# explicit link, but the Threads::Threads target is a portable no-op there.
+# Without this, libcore.a fails to link with undefined references to
+# pthread_create / pthread_join.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/shapelib)
 
@@ -42,6 +50,9 @@ list(
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/shapelib/shapefil_private.h)
 list(FILTER SOURCES EXCLUDE REGEX "main\.cpp")
 add_library(core ${SOURCES})
+# PUBLIC: propagate the thread-library requirement to anything linking core, so
+# the uwp executable (and any future consumer) also gets the right flag.
+target_link_libraries(core PUBLIC Threads::Threads)
 
 add_executable(uwp src/main.cpp)
 target_link_libraries(uwp PUBLIC core)
