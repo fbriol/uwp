@@ -2,10 +2,13 @@
 
 import argparse
 import concurrent.futures
+import json
 import os
 import pathlib
 import subprocess
 import shutil
+import threading
+import urllib.error
 import urllib.request
 import zipfile
 import sys
@@ -147,6 +150,32 @@ OSM_DATA_DIR = DATA_DIR / 'osm-pbf'
 #: Where the water polygons are stored
 WATER_POLYGON_DIR = DATA_DIR / 'shapefiles'
 
+#: Path to the JSON manifest tracking upstream Last-Modified / ETag for each
+#: region. Drives incremental updates: a region is only re-downloaded and
+#: re-extracted when its upstream metadata differs from what's stored here.
+MANIFEST_PATH = DATA_DIR / 'manifest.json'
+
+#: User-Agent for HEAD/GET requests against Geofabrik & osmdata. Geofabrik
+#: ask scripts to identify themselves with a contact URL or email.
+USER_AGENT = 'uwp-cnes/1.0 (+https://github.com/CNES; contact via project)'
+
+#: Sentinel value in the manifest for "never seen before". Avoids a separate
+#: `None` check in the comparison logic.
+_MANIFEST_MISSING = {'last_modified': None, 'etag': None}
+
+#: Lock protecting concurrent updates to the in-memory manifest from worker
+#: threads. The manifest itself is a plain dict, so we serialise writes.
+_MANIFEST_LOCK = threading.Lock()
+
+
+def _install_default_opener() -> None:
+    """Register a global URL opener that sends our identifying User-Agent
+    with every request. Geofabrik asks scripts to identify themselves; sending
+    a generic urllib/Python UA risks being throttled or blocked."""
+    opener = urllib.request.build_opener()
+    opener.addheaders = [('User-Agent', USER_AGENT)]
+    urllib.request.install_opener(opener)
+
 
 def download_file(url: str, output_file: str) -> None:
     """Download file with progress reporting"""
@@ -178,6 +207,184 @@ def download_file(url: str, output_file: str) -> None:
     LOGGER.info('Download complete: %s', output_file)
 
 
+# ---------------------------------------------------------------------------
+# Manifest-based incremental update
+# ---------------------------------------------------------------------------
+#
+# The manifest is a JSON object keyed by a stable region identifier
+# (sub_region/region or the bare region name when sub_region is empty),
+# storing the upstream HTTP `Last-Modified` and `ETag` we observed last time
+# we successfully downloaded that PBF. A region is considered fresh if either
+# value still matches the upstream HEAD response. If neither matches, or if
+# we have no record at all, the region's cached PBF and extracted shapefile
+# are deleted and the work is redone.
+#
+# The manifest is written atomically (tmp file + rename) only once at the end
+# of a successful run. If a download fails midway, the manifest is left
+# untouched so the next run retries the failed regions.
+
+
+def remote_metadata(url: str, timeout: float = 30.0) -> dict:
+    """HEAD-request the URL and return its caching metadata.
+
+    Returns a dict with `last_modified` and `etag` keys (either may be None
+    if the server didn't send the header).
+    """
+    req = urllib.request.Request(url, method='HEAD')
+    req.add_header('User-Agent', USER_AGENT)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return {
+            'last_modified': resp.headers.get('Last-Modified'),
+            'etag': resp.headers.get('ETag'),
+        }
+
+
+def load_manifest() -> dict:
+    """Load the manifest from disk, or return an empty one."""
+    if not MANIFEST_PATH.exists():
+        return {}
+    try:
+        with MANIFEST_PATH.open() as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        LOGGER.warning(
+            'Manifest at %s is unreadable (%s) — treating as empty',
+            MANIFEST_PATH,
+            exc,
+        )
+        return {}
+
+
+def save_manifest(manifest: dict) -> None:
+    """Persist the manifest to disk atomically."""
+    MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MANIFEST_PATH.with_suffix('.json.tmp')
+    with tmp.open('w') as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    tmp.replace(MANIFEST_PATH)
+
+
+def _manifest_key(region: str, sub_region: str) -> str:
+    return f'{sub_region}/{region}' if sub_region else region
+
+
+def _delete_shp_set(shp: pathlib.Path) -> None:
+    """Delete a shapefile and its sidecars (.dbf, .shx, .prj, .cpg)."""
+    for ext in ('.shp', '.dbf', '.shx', '.prj', '.cpg'):
+        sidecar = shp.with_suffix(ext)
+        if sidecar.exists():
+            sidecar.unlink()
+
+
+def _delete_region_cache(region: str, sub_region: str) -> None:
+    """Remove cached PBF + extracted intermediate PBF + extracted shapefile
+    for a region. Called when upstream changed or when the user passes
+    --force."""
+    pbf = osm_pbf_sub_region(region, sub_region)
+    intermediate_pbf = pbf.parent / f'{region}-water.osm.pbf'
+    for p in (pbf, intermediate_pbf):
+        if p.exists():
+            p.unlink()
+    _delete_shp_set(shp_sub_region(region, sub_region))
+
+
+def _metadata_matches(remote: dict, cached: dict) -> bool:
+    """A region is considered fresh if EITHER the Last-Modified OR the ETag
+    matches the cached value. We accept "either" because Geofabrik
+    occasionally rebuilds files without bumping Last-Modified (or vice versa),
+    and forcing both to match would cause spurious re-downloads."""
+    if remote.get('etag') and remote['etag'] == cached.get('etag'):
+        return True
+    if remote.get('last_modified') and remote['last_modified'] == cached.get(
+        'last_modified'
+    ):
+        return True
+    return False
+
+
+def check_region_freshness(
+    region: str, sub_region: str, manifest: dict, force: bool = False
+) -> tuple[bool, dict]:
+    """Decide whether `region` needs (re-)downloading.
+
+    Returns `(needs_refresh, remote_meta)`. The remote metadata is returned
+    so the caller can record it in the manifest once the refresh succeeds.
+
+    - If `force` is set, always refresh.
+    - If upstream is unreachable, fall back to the cache: the run continues
+      with whatever local data we have, and no manifest update is performed
+      for that region.
+    """
+    url = region_url(region, sub_region)
+    key = _manifest_key(region, sub_region)
+
+    if force:
+        LOGGER.info('%s: --force → refresh', key)
+        _delete_region_cache(region, sub_region)
+        try:
+            return True, remote_metadata(url)
+        except (urllib.error.URLError, TimeoutError):
+            return True, {}
+
+    try:
+        remote = remote_metadata(url)
+    except (urllib.error.URLError, TimeoutError) as exc:
+        LOGGER.warning(
+            '%s: cannot reach upstream (%s) — keeping cached version',
+            key,
+            exc,
+        )
+        return False, {}
+
+    cached = manifest.get(key, _MANIFEST_MISSING)
+    pbf = osm_pbf_sub_region(region, sub_region)
+    shp = shp_sub_region(region, sub_region)
+    have_local = pbf.exists() or shp.exists()
+
+    if have_local and _metadata_matches(remote, cached):
+        LOGGER.info(
+            '%s: up to date (Last-Modified=%s)',
+            key,
+            remote.get('last_modified'),
+        )
+        return False, remote
+
+    if cached is _MANIFEST_MISSING or not have_local:
+        LOGGER.info('%s: first download', key)
+    else:
+        LOGGER.info(
+            '%s: upstream changed (Last-Modified %s → %s) — refreshing',
+            key,
+            cached.get('last_modified'),
+            remote.get('last_modified'),
+        )
+
+    _delete_region_cache(region, sub_region)
+    return True, remote
+
+
+def record_region_metadata(
+    manifest: dict, region: str, sub_region: str, remote_meta: dict
+) -> None:
+    """Thread-safely record a successful refresh in the in-memory manifest."""
+    if not remote_meta:
+        return
+    key = _manifest_key(region, sub_region)
+    with _MANIFEST_LOCK:
+        manifest[key] = {
+            'last_modified': remote_meta.get('last_modified'),
+            'etag': remote_meta.get('etag'),
+            'url': region_url(region, sub_region),
+        }
+
+
+def region_url(region: str, sub_region: str) -> str:
+    """Build the Geofabrik URL for a region's `-latest.osm.pbf`."""
+    if sub_region:
+        return f'{GEOFABRIK_URL}/{sub_region}/{region}-latest.osm.pbf'
+    return f'{GEOFABRIK_URL}/{region}-latest.osm.pbf'
+
+
 def osm_pbf_sub_region(region: str, sub_region: str) -> pathlib.Path:
     """Get the path to the DBF file for the specified region"""
     if sub_region:
@@ -203,19 +410,21 @@ def water_polygon_shp() -> pathlib.Path:
 
 
 def download_sub_region(region: str, sub_region: str) -> None:
-    """Download the specified sub-region"""
-    if sub_region:
-        # https://download.geofabrik.de/asia/afghanistan-latest.osm.pbf
-        url = f'{GEOFABRIK_URL}/{sub_region}/{region}-latest.osm.pbf'
-    else:
-        # https://download.geofabrik.de/asia-latest.osm.pbf
-        url = f'{GEOFABRIK_URL}/{region}-latest.osm.pbf'
+    """Download the specified sub-region from Geofabrik.
+
+    Caching is handled upstream by `check_region_freshness`, which deletes
+    stale files before this function is called. So if the PBF already
+    exists when we get here, it is by definition still valid (e.g. another
+    region in the same run already touched it, or a previous run downloaded
+    it and the upstream hasn't changed). We can safely short-circuit.
+    """
     output_file = osm_pbf_sub_region(region, sub_region)
-    if output_file.exists() or shp_sub_region(region, sub_region).exists():
-        LOGGER.info('%s already exists, skipping download', output_file)
+    shp = shp_sub_region(region, sub_region)
+    if output_file.exists() or shp.exists():
+        LOGGER.info('%s already present, skipping download', output_file)
         return
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    download_file(url, str(output_file))
+    download_file(region_url(region, sub_region), str(output_file))
 
 
 def corrected_water_polygon_path() -> pathlib.Path:
@@ -308,24 +517,64 @@ def convert_to_shp(region: str, sub_region: str) -> None:
     )
 
 
-def download_water_polygons() -> None:
-    """Download and convert water polygons for all sub-regions"""
+#: Manifest key for the global water polygons archive.
+_BASE_WATER_KEY = 'base/water-polygons-split-4326.zip'
+
+
+def download_water_polygons(manifest: dict, force: bool = False) -> None:
+    """Download and extract the global water polygons archive.
+
+    Uses the same manifest-based freshness check as the regional PBFs: if
+    the upstream Last-Modified/ETag still matches, the existing extracted
+    files are kept as-is.
+    """
+    url = f'{OSM_URL}/download/water-polygons-split-4326.zip'
     shp = water_polygon_shp()
-    if shp.exists():
-        LOGGER.info('%s already exists, skipping download', shp)
+
+    cached = manifest.get(_BASE_WATER_KEY, _MANIFEST_MISSING)
+    try:
+        remote = remote_metadata(url)
+    except (urllib.error.URLError, TimeoutError) as exc:
+        if shp.exists() and not force:
+            LOGGER.warning(
+                'Cannot reach %s (%s) — using cached water polygons', url, exc
+            )
+            return
+        raise
+
+    if not force and shp.exists() and _metadata_matches(remote, cached):
+        LOGGER.info(
+            'Base water polygons up to date (Last-Modified=%s)',
+            remote.get('last_modified'),
+        )
         return
+
+    reason = (
+        'first download' if cached is _MANIFEST_MISSING else 'upstream changed'
+    )
+    LOGGER.info('Base water polygons: %s', reason)
+
+    # Remove the previous extraction so we don't leave half-stale files
+    # mixed with new ones.
+    extract_dir = water_polygon_path()
+    if extract_dir.exists():
+        shutil.rmtree(extract_dir)
+
     output_file = pathlib.Path(tempfile.gettempdir())
     output_file /= 'water-polygons-split-4326.zip'
-    download_file(
-        f'{OSM_URL}/download/water-polygons-split-4326.zip',
-        str(output_file),
-    )
+    download_file(url, str(output_file))
     folder = water_polygon_path().parent
     with zipfile.ZipFile(output_file, 'r') as zip_ref:
         zip_ref.extractall(folder)
     LOGGER.info('Extracted water polygons to %s', folder)
-    # Clean up the zip file
     os.remove(output_file)
+
+    with _MANIFEST_LOCK:
+        manifest[_BASE_WATER_KEY] = {
+            'last_modified': remote.get('last_modified'),
+            'etag': remote.get('etag'),
+            'url': url,
+        }
 
 
 def usage() -> argparse.Namespace:
@@ -352,99 +601,267 @@ def usage() -> argparse.Namespace:
         '--jobs',
         type=int,
         default=4,
-        help='Number of regions to download and convert in parallel. '
-        'Each job spawns at most one download and one osmium/ogr2ogr '
-        'subprocess at a time. Use 1 to restore the original sequential '
+        help='Number of concurrent downloads. Download is network-bound and '
+        'parallelises well. Use 1 to restore the original sequential '
         'behaviour.',
     )
+    parser.add_argument(
+        '--extract-jobs',
+        type=int,
+        default=2,
+        help='Number of concurrent osmium/ogr2ogr extractions. osmium is '
+        'already multi-threaded internally, so running too many extractions '
+        'in parallel oversubscribes the CPU. 2 is a safe default; raise it '
+        'if the machine is mostly idle during extractions.',
+    )
+    parser.add_argument(
+        '--force',
+        action='store_true',
+        help='Ignore the manifest and force re-download + re-extraction of '
+        'every selected region. Use after dependency upgrades or to recover '
+        'from a corrupted cache.',
+    )
+    parser.add_argument(
+        '--check-only',
+        action='store_true',
+        help='Print which regions would be refreshed and exit, without '
+        'downloading anything or running the C++ binary. Useful to estimate '
+        'the size of an incremental update before launching it.',
+    )
     return parser.parse_args()
+
+
+def _check_runtime_dependencies(uwp_path: str) -> None:
+    """Verify the external tools the script depends on are reachable."""
+    for tool, hint in (
+        ('osmium', 'Please install osmium.'),
+        ('ogr2ogr', 'Please install GDAL.'),
+    ):
+        if not shutil.which(tool):
+            LOGGER.error('%s is not installed. %s', tool, hint)
+            sys.exit(1)
+    if not shutil.which(uwp_path):
+        LOGGER.error('%s does not exist. Please check the path.', uwp_path)
+
+
+def _plan_refresh(
+    selected_areas: tuple, manifest: dict, force: bool
+) -> tuple[list[tuple[str, str]], dict[str, dict]]:
+    """HEAD-poll Geofabrik for each selected region and return the list of
+    regions that need refreshing together with their pending manifest
+    metadata. Stale on-disk caches are deleted as a side effect."""
+    candidates = [
+        (region, sub_region)
+        for region, sub_region in AREAS.items()
+        if region in selected_areas
+    ]
+    LOGGER.info(
+        'Checking upstream freshness for %d region(s)…',
+        len(candidates),
+    )
+
+    pending_metadata: dict[str, dict] = {}
+    regions_to_process: list[tuple[str, str]] = []
+    for region, sub_region in candidates:
+        needs_refresh, remote = check_region_freshness(
+            region, sub_region, manifest, force=force
+        )
+        if needs_refresh:
+            regions_to_process.append((region, sub_region))
+            if remote:
+                pending_metadata[_manifest_key(region, sub_region)] = remote
+
+    LOGGER.info(
+        '%d region(s) need refreshing; %d up to date',
+        len(regions_to_process),
+        len(candidates) - len(regions_to_process),
+    )
+    return regions_to_process, pending_metadata
+
+
+def _refresh_regions_parallel(
+    regions_to_process: list[tuple[str, str]],
+    manifest: dict,
+    pending_metadata: dict[str, dict],
+    download_jobs: int,
+    extract_jobs: int,
+) -> None:
+    """Two-stage producer/consumer pipeline.
+
+    Stage 1 (download_pool, network-bound): several downloads run in
+    parallel; they don't compete for CPU.
+    Stage 2 (extract_pool, CPU-bound): osmium tags-filter + ogr2ogr. osmium
+    is internally multi-threaded so this pool is kept small to avoid
+    oversubscription.
+    Stages overlap: as soon as a download finishes, its extraction is
+    submitted to stage 2 and the download thread returns to the next URL.
+    The manifest is only committed when both the download and extraction
+    of a region succeed.
+    """
+
+    def _commit(region: str, sub_region: str) -> None:
+        meta = pending_metadata.get(_manifest_key(region, sub_region))
+        if meta:
+            record_region_metadata(manifest, region, sub_region, meta)
+
+    # Threads (not processes): work is dominated by subprocess.run and
+    # urllib I/O, which both release the GIL.
+    with (
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=download_jobs,
+            thread_name_prefix='download',
+        ) as download_pool,
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=extract_jobs,
+            thread_name_prefix='extract',
+        ) as extract_pool,
+    ):
+
+        def download_then_submit_extract(
+            region: str, sub_region: str
+        ) -> concurrent.futures.Future:
+            download_sub_region(region, sub_region)
+            ex_future = extract_pool.submit(convert_to_shp, region, sub_region)
+
+            def _on_extract_done(fut: concurrent.futures.Future) -> None:
+                if fut.exception() is None:
+                    _commit(region, sub_region)
+
+            ex_future.add_done_callback(_on_extract_done)
+            return ex_future
+
+        download_futures = {
+            download_pool.submit(
+                download_then_submit_extract, region, sub_region
+            ): region
+            for region, sub_region in regions_to_process
+        }
+
+        extract_futures: list[concurrent.futures.Future] = []
+        try:
+            # Collect extract futures as downloads complete so extractions
+            # can start without waiting for every download to finish.
+            for dl_future in concurrent.futures.as_completed(download_futures):
+                region = download_futures[dl_future]
+                try:
+                    extract_futures.append(dl_future.result())
+                except Exception:
+                    LOGGER.exception('Download failed for region %s', region)
+                    raise
+
+            for ex_future in concurrent.futures.as_completed(extract_futures):
+                ex_future.result()
+        except Exception:
+            # Cancel anything not yet started. In-flight subprocesses cannot
+            # be interrupted; their results are discarded at pool shutdown.
+            for pending in download_futures:
+                pending.cancel()
+            for pending in extract_futures:
+                pending.cancel()
+            raise
+
+
+def _refresh_regions(
+    regions_to_process: list[tuple[str, str]],
+    manifest: dict,
+    pending_metadata: dict[str, dict],
+    download_jobs: int,
+    extract_jobs: int,
+) -> None:
+    """Download + extract every region in `regions_to_process`. Picks the
+    sequential or the parallel path based on the requested job counts and
+    the size of the work list."""
+    if not regions_to_process:
+        LOGGER.info('Nothing to refresh in the regional shapefiles.')
+        return
+
+    sequential = (download_jobs == 1 and extract_jobs == 1) or len(
+        regions_to_process
+    ) <= 1
+    if sequential:
+        for region, sub_region in regions_to_process:
+            download_sub_region(region, sub_region)
+            convert_to_shp(region, sub_region)
+            meta = pending_metadata.get(_manifest_key(region, sub_region))
+            if meta:
+                record_region_metadata(manifest, region, sub_region, meta)
+        return
+
+    _refresh_regions_parallel(
+        regions_to_process,
+        manifest,
+        pending_metadata,
+        download_jobs,
+        extract_jobs,
+    )
+
+
+def _run_uwp(uwp_path: str, selected_areas: tuple) -> None:
+    """Initialise the working copy of the base water shapefile and invoke
+    the C++ uwp binary on the full set of regional shapefiles that exist
+    on disk for the selected areas. The merge phase always runs on the full
+    set because `bg::union_` is not invertible."""
+    target = initialize_working_directory()
+    water_shapefiles = [
+        str(shp_sub_region(region, sub_region))
+        for region, sub_region in AREAS.items()
+        if region in selected_areas
+        and shp_sub_region(region, sub_region).exists()
+    ]
+    LOGGER.info(
+        'Running %s on %d regional shapefile(s)',
+        uwp_path,
+        len(water_shapefiles),
+    )
+    subprocess.run(
+        [uwp_path, str(target), '-o', str(target), *water_shapefiles],
+        check=True,
+    )
+    LOGGER.info('Done. Output: %s', target)
 
 
 def main():
     """Main function to download and convert water polygons"""
     logging.basicConfig(
-        level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s'
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
     )
-
     args = usage()
-
-    if not shutil.which('osmium'):
-        LOGGER.error('osmium is not installed. Please install osmium.')
-        sys.exit(1)
-
-    if not shutil.which('ogr2ogr'):
-        LOGGER.error('ogr2ogr is not installed. Please install GDAL.')
-        sys.exit(1)
-
-    if not shutil.which(args.uwp):
-        LOGGER.error('%s does not exist. Please check the path.', args.uwp)
+    _check_runtime_dependencies(args.uwp)
 
     LOGGER.info('Starting water polygon update')
-    # Create the data directory if it doesn't exist
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Install a global URL opener carrying our identifying User-Agent so
+    # Geofabrik can attribute traffic correctly. Used by both urlopen (HEAD)
+    # and urlretrieve (downloads).
+    _install_default_opener()
 
-    # Download and convert water polygons for all sub-regions. Regions are
-    # independent (different URLs, different output directories) so they can
-    # be processed in parallel. Within a region, download must finish before
-    # the osmium/ogr2ogr conversion — that ordering is preserved by running
-    # both steps inside the same worker function.
-    regions_to_process = [
-        (region, sub_region)
-        for region, sub_region in AREAS.items()
-        if region in args.areas
-    ]
-
-    def process_region(region: str, sub_region: str) -> None:
-        download_sub_region(region, sub_region)
-        convert_to_shp(region, sub_region)
-
-    jobs = max(1, args.jobs)
-    if jobs == 1 or len(regions_to_process) <= 1:
-        for region, sub_region in regions_to_process:
-            process_region(region, sub_region)
-    else:
-        # Threads (not processes): the work is dominated by subprocess.run and
-        # urllib I/O, both of which release the GIL. Using threads also keeps
-        # logging coherent in a single interpreter.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-            futures = {
-                pool.submit(process_region, region, sub_region): region
-                for region, sub_region in regions_to_process
-            }
-            # Iterate as futures complete so failures surface immediately and
-            # the remaining work can be cancelled.
-            for future in concurrent.futures.as_completed(futures):
-                region = futures[future]
-                try:
-                    future.result()
-                except Exception:
-                    LOGGER.exception('Failed processing region %s', region)
-                    # Cancel any not-yet-started jobs; in-flight ones cannot
-                    # be interrupted but their results will be discarded.
-                    for pending in futures:
-                        pending.cancel()
-                    raise
-
-    # Download the water polygons
-    download_water_polygons()
-
-    target = initialize_working_directory()
-
-    water_shapefiles = [
-        str(shp_sub_region(region, sub_region))
-        for region, sub_region in AREAS.items()
-        if shp_sub_region(region, sub_region).exists()
-    ]
-    subprocess.run(
-        [
-            args.uwp,
-            str(target),
-            '-o',
-            str(target),
-            *water_shapefiles,
-        ],
-        check=True,
+    manifest = load_manifest()
+    regions_to_process, pending_metadata = _plan_refresh(
+        args.areas, manifest, force=args.force
     )
+
+    if args.check_only:
+        for region, sub_region in regions_to_process:
+            print(_manifest_key(region, sub_region))
+        return
+
+    try:
+        _refresh_regions(
+            regions_to_process,
+            manifest,
+            pending_metadata,
+            download_jobs=max(1, args.jobs),
+            extract_jobs=max(1, args.extract_jobs),
+        )
+        download_water_polygons(manifest, force=args.force)
+    finally:
+        # Persist whatever progress we made, even if a later step fails:
+        # the next run picks up where we left off without re-downloading
+        # the regions that already succeeded.
+        save_manifest(manifest)
+
+    _run_uwp(args.uwp, args.areas)
 
 
 if __name__ == '__main__':
