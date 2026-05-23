@@ -88,7 +88,7 @@ else
 fi
 
 log "Activating env '$ENV_NAME'"
-conda activate "$ENV_NAME"
+$CONDA_TOOL activate "$ENV_NAME"
 
 # Quick sanity checks on the tools the Python script depends on.
 for tool in osmium ogr2ogr cmake; do
@@ -140,7 +140,7 @@ cat <<EOF >&2
 
 Next steps:
 
-  conda activate $ENV_NAME
+  $CONDA_TOOL activate $ENV_NAME
   python $REPO_ROOT/script/update_water_polygons.py --help
 
 EOF
