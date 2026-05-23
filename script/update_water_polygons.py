@@ -154,6 +154,12 @@ OSM_DATA_DIR = DATA_DIR / 'osm-pbf'
 #: Where the water polygons are stored
 WATER_POLYGON_DIR = DATA_DIR / 'shapefiles'
 
+#: Custom osmconf.ini for ogr2ogr. GDAL's stock config does not expose the
+#: `water=*` tag as a queryable column on the multipolygons layer, so the
+#: -where filter below would error with "water not recognised as an
+#: available field". Our version adds it.
+OSM_CONFIG_FILE = pathlib.Path(__file__).parent / 'osmconf.ini'
+
 #: Path to the JSON manifest tracking upstream Last-Modified / ETag for each
 #: region. Drives incremental updates: a region is only re-downloaded and
 #: re-extracted when its upstream metadata differs from what's stored here.
@@ -621,6 +627,16 @@ def convert_to_shp(region: str, sub_region: str) -> None:
 
     ogr_env = os.environ.copy()
     ogr_env['OGR_GEOMETRY_ACCEPT_UNCLOSED_RING'] = 'NO'
+    # Point GDAL's OSM driver at our custom config that exposes the
+    # `water` tag. Without it the -where filter below fails because GDAL's
+    # default config doesn't surface `water=*` as a column.
+    if OSM_CONFIG_FILE.exists():
+        ogr_env['OSM_CONFIG_FILE'] = str(OSM_CONFIG_FILE)
+    else:
+        LOGGER.warning(
+            'osmconf.ini not found at %s — `water` tag may be unavailable',
+            OSM_CONFIG_FILE,
+        )
 
     subprocess.run(
         [
