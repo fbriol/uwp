@@ -77,6 +77,28 @@ void emit_clipped_pieces(const Polygon &area_polygon, const Box &water_env,
   }
 }
 
+// Orphan-flavoured variant of `emit_clipped_pieces`: same clipping logic
+// (clip to anchor envelope + max_inland_km buffer) but no water_idx
+// pairing — orphans live as standalone polygons in the output.
+void emit_clipped_orphan(const Polygon &area_polygon, const Box &anchor_env,
+                         double max_inland_km, std::vector<Polygon> &out) {
+  if (max_inland_km <= 0.0) {
+    out.emplace_back(area_polygon);
+    return;
+  }
+  const Box cap = build_cap_box(anchor_env, max_inland_km);
+  const Box area_env = bg::return_envelope<Box>(area_polygon);
+  if (bg::covered_by(area_env, cap)) {
+    out.emplace_back(area_polygon);
+    return;
+  }
+  std::vector<Polygon> clipped;
+  bg::intersection(area_polygon, cap, clipped);
+  for (auto &&piece : clipped) {
+    out.emplace_back(std::move(piece));
+  }
+}
+
 }  // namespace
 
 // Inverted-loop helper: for each area polygon in [i0, i1), query the water
@@ -135,20 +157,68 @@ inline auto select_overlap_local(const Shapefile &water_shp,
     }
 
     // Phase 2: if no intersection found and max_inland_km > 0, look for
-    // a coast polygon WITHIN max_inland_km of the area polygon. If one
-    // exists, the area polygon is an "orphan coastal feature" (typical
-    // for deltaic rivers / lagoons that don't touch the OSM coastline
-    // base directly but are clearly coastal). Include it as-is — no
-    // union with any coast polygon, just standalone in the output.
+    // a coast polygon truly within max_inland_km of the area polygon
+    // (using actual polygon-to-polygon distance, not just bbox overlap).
+    // If found, the area polygon is an "orphan coastal feature": include
+    // it standalone (no union with any coast), but clip it to the
+    // nearest coast's envelope + max_inland_km buffer so a long river
+    // polygon doesn't drag inland.
     if (!matched_any && max_inland_km > 0.0) {
       const Box neighbourhood = build_cap_box(envelope, max_inland_km);
       water_candidates.clear();
       water_rtree.query(bg::index::intersects(neighbourhood),
                         std::back_inserter(water_candidates));
-      if (!water_candidates.empty()) {
-        out.orphans.emplace_back(area_polygon);
+
+      // Tight distance check: compute actual polygon-to-polygon distance
+      // and keep only candidates within the threshold. The bbox-based
+      // rtree query above is a coarse prefilter — its hits include
+      // false positives where the bbox is near but the actual geometry
+      // is far away.
+      // Cheap latitude-aware degree → km conversion at the area's
+      // centroid latitude (orphans are usually small enough that
+      // varying lat across the polygon doesn't matter).
+      const double lat_mid = (bg::get<bg::min_corner, 1>(envelope) +
+                              bg::get<bg::max_corner, 1>(envelope)) *
+                             0.5;
+      const double cos_lat = std::max(0.01, std::cos(lat_mid * M_PI / 180.0));
+      const double threshold_deg = max_inland_km / KM_PER_DEG_LAT;
+      // For longitude-direction distance, the threshold scales by
+      // cos(lat). We use the smaller of the two as a conservative
+      // bound (distance > min(threshold_lat, threshold_lon) is the
+      // tightest exclusion). In practice envelope-distance in degrees
+      // mixes both axes — use the lat threshold (smaller) as a
+      // conservative filter.
+      const double threshold_env_deg = threshold_deg * cos_lat;
+
+      const Box *nearest_env = nullptr;
+      double nearest_dist = std::numeric_limits<double>::max();
+      for (const auto &c : water_candidates) {
+        // Cheap envelope-distance lower bound first — skip the
+        // expensive polygon distance when the envelopes are far apart.
+        const double env_dist = bg::distance(envelope, c.first);
+        if (env_dist > threshold_env_deg) {
+          continue;
+        }
+        // Actual polygon-to-polygon distance (0 if they touch).
+        const double poly_dist =
+            bg::distance(area_polygon, *water_polygons[c.second]);
+        if (poly_dist > threshold_env_deg) {
+          continue;
+        }
+        if (poly_dist < nearest_dist) {
+          nearest_dist = poly_dist;
+          nearest_env = &c.first;
+        }
       }
-      // else: too far from any coast → real orphan, dropped.
+
+      if (nearest_env != nullptr) {
+        // Clip the orphan to anchor envelope + max_inland_km buffer
+        // (same logic as matched polygons), so a long river polygon
+        // gets trimmed to its seaward portion.
+        emit_clipped_orphan(area_polygon, *nearest_env, max_inland_km,
+                            out.orphans);
+      }
+      // else: no coast within max_inland_km → real orphan, dropped.
     }
   }
   return out;
