@@ -46,3 +46,4 @@ dependencies:
   - matplotlib-base=3.9.*  # plotting backend (skip the qt extras)
   - contextily=1.6.*     # OSM basemap tiles (optional, used with --basemap)
   - pyogrio=0.10.*       # fast shapefile reader (geopandas backend)
+  - folium=0.17.*        # interactive HTML map (visualize_interactive.py)
