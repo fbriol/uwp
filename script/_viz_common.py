@@ -69,6 +69,17 @@ _BASEMAP_CHOICES = (
 # 45deg by 45deg covering the globe. See `_geohash1_bbox`.
 _GEOHASH_BASE32 = '0123456789bcdefghjkmnpqrstuvwxyz'
 
+# Default basemap tile cache. We deliberately avoid ~/.cache because HOME
+# is small-quota on most HPC clusters (the CNES one fills up fast). The
+# repo's `data/` is the right place: `init_workspace.sh` symlinks it to
+# scratch space when UWP_DATA_DIR is set. Overridable via
+# `--basemap-cache-dir` or the UWP_TILE_CACHE env var.
+DEFAULT_TILE_CACHE = (
+    pathlib.Path(os.environ['UWP_TILE_CACHE'])
+    if os.environ.get('UWP_TILE_CACHE')
+    else pathlib.Path(__file__).parent.parent / 'data' / '_tile_cache'
+)
+
 
 # ---------------------------------------------------------------------------
 # Geohash helpers
@@ -763,8 +774,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         '--basemap-cache-dir',
         type=pathlib.Path,
-        default=pathlib.Path.home() / '.cache' / 'uwp-basemap-tiles',
-        help='Shared cache for basemap tiles.',
+        default=DEFAULT_TILE_CACHE,
+        help='Shared cache for basemap tiles. Defaults to '
+        '<repo>/data/_tile_cache (on the CNES cluster this lives on '
+        'scratch via the symlink set up by init_workspace.sh) — not in '
+        '~/.cache, which has tight quota. Override with '
+        'UWP_TILE_CACHE env var or this flag.',
     )
     parser.add_argument(
         '--max-images',
