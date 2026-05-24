@@ -97,9 +97,23 @@ int main(int argc, char* argv[]) {
 
     auto area_shp = uwp::Shapefile(region_file);
 
-    auto overlap =
+    auto selection =
         uwp::select_overlap(water_shp, *(area_shp.polygons()), max_inland_km);
-    uwp::merge_overlapping(water_shp, overlap, patches_ptr);
+
+    // Phase 1: matched polygons get unioned with their host coast polygon
+    // (or pushed as extras if disconnected after union).
+    uwp::merge_overlapping(water_shp, selection.matched, patches_ptr);
+
+    // Phase 2: orphan coastal features (no coast intersection but close
+    // enough per --max-inland-km) are appended as-is to the coastline and
+    // to the patches shapefile. We keep them standalone — no union with
+    // any existing polygon — so they remain identifiable in patches.shp.
+    for (auto&& orphan : selection.orphans) {
+      if (patches_ptr != nullptr) {
+        patches_ptr->append(orphan);  // copy (need it for water_shp too)
+      }
+      water_shp.append(std::move(orphan));
+    }
   }
 
   // Save the final result

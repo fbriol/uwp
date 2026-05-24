@@ -91,13 +91,18 @@ void emit_clipped_pieces(const Polygon &area_polygon, const Box &water_env,
 // invariant the merge phase relies on: each water index appears in the
 // returned grouping at most once (after the post-loop groupby), so the merge
 // can mutate water polygons without cross-thread synchronization.
+// Worker output: matched pairs + orphan polygons accumulated in one chunk.
+struct LocalSelection {
+  std::vector<std::pair<size_t, Polygon>> matched;
+  std::vector<Polygon> orphans;
+};
+
 inline auto select_overlap_local(const Shapefile &water_shp,
                                  const Shapefile::PolygonList &area,
                                  const size_t i0, const size_t i1,
-                                 double max_inland_km)
-    -> std::vector<std::pair<size_t, Polygon>> {
-  auto result = std::vector<std::pair<size_t, Polygon>>();
-  result.reserve(i1 - i0);
+                                 double max_inland_km) -> LocalSelection {
+  auto out = LocalSelection{};
+  out.matched.reserve(i1 - i0);
 
   const auto &water_polygons = *water_shp.polygons();
   const auto &water_rtree = *water_shp.rtree();
@@ -105,52 +110,69 @@ inline auto select_overlap_local(const Shapefile &water_shp,
   std::vector<Shapefile::PolygonIndex> water_candidates;
   for (size_t ix = i0; ix < i1; ++ix) {
     const auto &area_polygon = *area[ix];
+    const auto envelope = bg::return_envelope<Box>(area_polygon);
 
-    // Envelope of the area polygon.
-    auto envelope = bg::return_envelope<Box>(area_polygon);
-
-    // Query the water R-tree for candidate water polygons.
+    // Phase 1: try to match against a coast polygon that the area
+    // polygon actually intersects (and is not fully inside).
     water_candidates.clear();
     water_rtree.query(bg::index::intersects(envelope),
                       std::back_inserter(water_candidates));
-    if (water_candidates.empty()) {
-      continue;
-    }
 
+    bool matched_any = false;
     for (const auto &candidate : water_candidates) {
       const auto water_idx = candidate.second;
       const auto &water_polygon = *water_polygons[water_idx];
-
       if (!bg::intersects(water_polygon, area_polygon) ||
           bg::within(area_polygon, water_polygon)) {
         continue;
       }
-
       // Exclusive assignment: this area polygon (or its clipped pieces)
       // belongs to `water_idx` only.
       emit_clipped_pieces(area_polygon, candidate.first, max_inland_km,
-                          water_idx, result);
+                          water_idx, out.matched);
+      matched_any = true;
       break;
     }
+
+    // Phase 2: if no intersection found and max_inland_km > 0, look for
+    // a coast polygon WITHIN max_inland_km of the area polygon. If one
+    // exists, the area polygon is an "orphan coastal feature" (typical
+    // for deltaic rivers / lagoons that don't touch the OSM coastline
+    // base directly but are clearly coastal). Include it as-is — no
+    // union with any coast polygon, just standalone in the output.
+    if (!matched_any && max_inland_km > 0.0) {
+      const Box neighbourhood = build_cap_box(envelope, max_inland_km);
+      water_candidates.clear();
+      water_rtree.query(bg::index::intersects(neighbourhood),
+                        std::back_inserter(water_candidates));
+      if (!water_candidates.empty()) {
+        out.orphans.emplace_back(area_polygon);
+      }
+      // else: too far from any coast → real orphan, dropped.
+    }
   }
-  return result;
+  return out;
 }
 
 auto select_overlap(const Shapefile &water_shp,
                     const Shapefile::PolygonList &area, double max_inland_km)
-    -> std::vector<std::pair<size_t, std::vector<Polygon>>> {
+    -> SelectOverlapResult {
   auto pairs = std::vector<std::pair<size_t, Polygon>>();
+  auto orphans = std::vector<Polygon>();
   auto mutex = std::mutex();
 
-  auto worker = [&water_shp, &area, &pairs, &mutex, max_inland_km](
+  auto worker = [&water_shp, &area, &pairs, &orphans, &mutex, max_inland_km](
                     const size_t i0, const size_t i1) {
     auto local = select_overlap_local(water_shp, area, i0, i1, max_inland_km);
-    if (local.empty()) {
+    if (local.matched.empty() && local.orphans.empty()) {
       return;
     }
     std::lock_guard<std::mutex> lock(mutex);
-    pairs.insert(pairs.end(), std::make_move_iterator(local.begin()),
-                 std::make_move_iterator(local.end()));
+    pairs.insert(pairs.end(), std::make_move_iterator(local.matched.begin()),
+                 std::make_move_iterator(local.matched.end()));
+    orphans.insert(orphans.end(),
+                   std::make_move_iterator(local.orphans.begin()),
+                   std::make_move_iterator(local.orphans.end()));
   };
   // num_threads = 0 → use std::thread::hardware_concurrency(); chunk size is
   // chosen dynamically inside parallel_for to balance load across threads.
@@ -166,11 +188,16 @@ auto select_overlap(const Shapefile &water_shp,
     grouped[p.first].emplace_back(std::move(p.second));
   }
 
-  auto result = std::vector<std::pair<size_t, std::vector<Polygon>>>();
-  result.reserve(grouped.size());
+  auto result = SelectOverlapResult{};
+  result.matched.reserve(grouped.size());
   for (auto &&kv : grouped) {
     std::cout << "#" << kv.first << " " << kv.second.size() << std::endl;
-    result.emplace_back(kv.first, std::move(kv.second));
+    result.matched.emplace_back(kv.first, std::move(kv.second));
+  }
+  result.orphans = std::move(orphans);
+  if (!result.orphans.empty()) {
+    std::cout << "Orphans (no coast intersection, within " << max_inland_km
+              << " km of coast): " << result.orphans.size() << std::endl;
   }
   return result;
 }
