@@ -720,17 +720,17 @@ def convert_to_shp(region: str, sub_region: str) -> None:
     #
     #   w  natural=water           — most lakes / lagoons / bays / small
     #                                rivers (single-way polygons).
+    #   w  natural=shoal           — intertidal sandbars / mudflats.
+    #                                Submerged at high tide; SWOT sees
+    #                                them as water most of the cycle.
     #   r  natural=water           — *modern* multipolygon relations for
     #                                large water bodies (estuaries with
     #                                islands, river systems modelled as
-    #                                one big relation). This is the tag
-    #                                missing from older versions of this
-    #                                script — without it, the middle of a
-    #                                relation-modelled river vanishes
-    #                                from the patches.
+    #                                one big relation).
     #   r  natural=waterway        — legacy (pre-2014) tag, still found
     #                                on older relations in low-edit
     #                                regions. Kept for compatibility.
+    #   r  natural=shoal           — multipolygon variant of the above.
     #   wr waterway=riverbank      — deprecated tag (replaced by
     #                                `natural=water + water=river`) but
     #                                still present in some PBFs.
@@ -742,14 +742,10 @@ def convert_to_shp(region: str, sub_region: str) -> None:
             'osmium',
             'tags-filter',
             str(osm_pbf),
-            'w',
-            'natural=water',
-            'r',
-            'natural=water,waterway',
-            'wr',
-            'waterway=riverbank',
-            '-o',
-            str(water_pbf),
+            'w', 'natural=water,shoal',
+            'r', 'natural=water,waterway,shoal',
+            'wr', 'waterway=riverbank',
+            '-o', str(water_pbf),
             '--overwrite',
         ],
         check=True,
