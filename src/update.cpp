@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <cmath>
 #include <mutex>
+#include <numeric>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "uwp/parallel_for.hpp"
 
@@ -99,6 +101,101 @@ void emit_clipped_orphan(const Polygon &area_polygon, const Box &anchor_env,
   }
 }
 
+// Union-Find with path compression and rank — used to identify
+// connected components of area polygons in the cascading orphan pass.
+class UnionFind {
+ public:
+  explicit UnionFind(size_t n) : parent_(n), rank_(n, 0) {
+    std::iota(parent_.begin(), parent_.end(), size_t{0});
+  }
+
+  auto find(size_t x) -> size_t {
+    while (parent_[x] != x) {
+      parent_[x] = parent_[parent_[x]];  // path compression
+      x = parent_[x];
+    }
+    return x;
+  }
+
+  void unite(size_t a, size_t b) {
+    a = find(a);
+    b = find(b);
+    if (a == b) return;
+    if (rank_[a] < rank_[b]) std::swap(a, b);
+    parent_[b] = a;
+    if (rank_[a] == rank_[b]) {
+      ++rank_[a];
+    }
+  }
+
+ private:
+  std::vector<size_t> parent_;
+  std::vector<size_t> rank_;
+};
+
+// Find non-matched area polygons that belong to the same connected
+// component as a matched one — i.e. coastal polygons that don't touch
+// the OSM coastline directly but ARE part of the coastal water network
+// via a chain of intersecting OSM water polygons. Typical use case:
+// deltaic river channels that connect to other channels which
+// eventually touch the open sea. Inland lakes have no neighbours and
+// stay in their own (non-coastal) component → excluded.
+//
+// Returns area-polygon indices to be included as orphans.
+auto compute_cascading_orphans(const Shapefile::PolygonList &area,
+                               const std::vector<char> &matched_flags)
+    -> std::vector<size_t> {
+  const size_t n = area.size();
+
+  // Build an R-tree on the area polygons' envelopes so we only test
+  // intersection between polygons whose envelopes overlap.
+  std::vector<Shapefile::PolygonIndex> indexed;
+  indexed.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    indexed.emplace_back(bg::return_envelope<Box>(*area[i]), i);
+  }
+  auto area_rtree = Shapefile::RTree(indexed);
+
+  // Union-Find over all area polygons. Linked pairs = polygons whose
+  // geometries actually intersect (envelope is only a cheap prefilter).
+  UnionFind uf(n);
+  std::vector<Shapefile::PolygonIndex> candidates;
+  for (size_t i = 0; i < n; ++i) {
+    const auto envelope = bg::return_envelope<Box>(*area[i]);
+    candidates.clear();
+    area_rtree.query(bg::index::intersects(envelope),
+                     std::back_inserter(candidates));
+    for (const auto &c : candidates) {
+      const size_t j = c.second;
+      if (j <= i) continue;                     // pair handled once
+      if (uf.find(i) == uf.find(j)) continue;   // already linked
+      if (bg::intersects(*area[i], *area[j])) {
+        uf.unite(i, j);
+      }
+    }
+  }
+
+  // Identify roots of components that contain at least one matched
+  // polygon — those are the "coastal" components.
+  std::unordered_set<size_t> coastal_roots;
+  for (size_t i = 0; i < n; ++i) {
+    if (matched_flags[i] != 0) {
+      coastal_roots.insert(uf.find(i));
+    }
+  }
+
+  // Non-matched polygons whose component is coastal get included as
+  // orphans. Matched polygons are already in the matched list.
+  std::vector<size_t> orphan_indices;
+  for (size_t i = 0; i < n; ++i) {
+    if (matched_flags[i] != 0) continue;
+    if (coastal_roots.count(uf.find(i)) > 0) {
+      orphan_indices.push_back(i);
+    }
+  }
+  return orphan_indices;
+}
+
 }  // namespace
 
 // Inverted-loop helper: for each area polygon in [i0, i1), query the water
@@ -113,10 +210,12 @@ void emit_clipped_orphan(const Polygon &area_polygon, const Box &anchor_env,
 // invariant the merge phase relies on: each water index appears in the
 // returned grouping at most once (after the post-loop groupby), so the merge
 // can mutate water polygons without cross-thread synchronization.
-// Worker output: matched pairs + orphan polygons accumulated in one chunk.
+// Worker output: matched (water_idx, polygon) pairs for one chunk, plus
+// the area indices that found a match (used for the cascading orphan
+// pass after all workers join).
 struct LocalSelection {
   std::vector<std::pair<size_t, Polygon>> matched;
-  std::vector<Polygon> orphans;
+  std::vector<size_t> matched_indices;  // area indices that got matched
 };
 
 inline auto select_overlap_local(const Shapefile &water_shp,
@@ -134,13 +233,10 @@ inline auto select_overlap_local(const Shapefile &water_shp,
     const auto &area_polygon = *area[ix];
     const auto envelope = bg::return_envelope<Box>(area_polygon);
 
-    // Phase 1: try to match against a coast polygon that the area
-    // polygon actually intersects (and is not fully inside).
     water_candidates.clear();
     water_rtree.query(bg::index::intersects(envelope),
                       std::back_inserter(water_candidates));
 
-    bool matched_any = false;
     for (const auto &candidate : water_candidates) {
       const auto water_idx = candidate.second;
       const auto &water_polygon = *water_polygons[water_idx];
@@ -152,106 +248,68 @@ inline auto select_overlap_local(const Shapefile &water_shp,
       // belongs to `water_idx` only.
       emit_clipped_pieces(area_polygon, candidate.first, max_inland_km,
                           water_idx, out.matched);
-      matched_any = true;
+      out.matched_indices.push_back(ix);
       break;
-    }
-
-    // Phase 2: if no intersection found and max_inland_km > 0, look for
-    // a coast polygon truly within max_inland_km of the area polygon
-    // (using actual polygon-to-polygon distance, not just bbox overlap).
-    // If found, the area polygon is an "orphan coastal feature": include
-    // it standalone (no union with any coast), but clip it to the
-    // nearest coast's envelope + max_inland_km buffer so a long river
-    // polygon doesn't drag inland.
-    if (!matched_any && max_inland_km > 0.0) {
-      const Box neighbourhood = build_cap_box(envelope, max_inland_km);
-      water_candidates.clear();
-      water_rtree.query(bg::index::intersects(neighbourhood),
-                        std::back_inserter(water_candidates));
-
-      // Tight distance check: compute actual polygon-to-polygon distance
-      // and keep only candidates within the threshold. The bbox-based
-      // rtree query above is a coarse prefilter — its hits include
-      // false positives where the bbox is near but the actual geometry
-      // is far away.
-      // Cheap latitude-aware degree → km conversion at the area's
-      // centroid latitude (orphans are usually small enough that
-      // varying lat across the polygon doesn't matter).
-      const double lat_mid = (bg::get<bg::min_corner, 1>(envelope) +
-                              bg::get<bg::max_corner, 1>(envelope)) *
-                             0.5;
-      const double cos_lat = std::max(0.01, std::cos(lat_mid * M_PI / 180.0));
-      const double threshold_deg = max_inland_km / KM_PER_DEG_LAT;
-      // For longitude-direction distance, the threshold scales by
-      // cos(lat). We use the smaller of the two as a conservative
-      // bound (distance > min(threshold_lat, threshold_lon) is the
-      // tightest exclusion). In practice envelope-distance in degrees
-      // mixes both axes — use the lat threshold (smaller) as a
-      // conservative filter.
-      const double threshold_env_deg = threshold_deg * cos_lat;
-
-      const Box *nearest_env = nullptr;
-      double nearest_dist = std::numeric_limits<double>::max();
-      for (const auto &c : water_candidates) {
-        // Cheap envelope-distance lower bound first — skip the
-        // expensive polygon distance when the envelopes are far apart.
-        const double env_dist = bg::distance(envelope, c.first);
-        if (env_dist > threshold_env_deg) {
-          continue;
-        }
-        // Actual polygon-to-polygon distance (0 if they touch).
-        const double poly_dist =
-            bg::distance(area_polygon, *water_polygons[c.second]);
-        if (poly_dist > threshold_env_deg) {
-          continue;
-        }
-        if (poly_dist < nearest_dist) {
-          nearest_dist = poly_dist;
-          nearest_env = &c.first;
-        }
-      }
-
-      if (nearest_env != nullptr) {
-        // Clip the orphan to anchor envelope + max_inland_km buffer
-        // (same logic as matched polygons), so a long river polygon
-        // gets trimmed to its seaward portion.
-        emit_clipped_orphan(area_polygon, *nearest_env, max_inland_km,
-                            out.orphans);
-      }
-      // else: no coast within max_inland_km → real orphan, dropped.
     }
   }
   return out;
 }
 
+// Nearest coast polygon's envelope, looked up via the water R-tree.
+// Returns nullptr if no coast lies within `max_inland_km` of the area
+// polygon's envelope. Used as the clip anchor for orphan polygons.
+auto nearest_coast_envelope(const Shapefile &water_shp,
+                            const Polygon &area_polygon,
+                            double max_inland_km) -> const Box * {
+  static thread_local std::vector<Shapefile::PolygonIndex> candidates;
+  const Box envelope = bg::return_envelope<Box>(area_polygon);
+  const Box neighbourhood = build_cap_box(envelope, max_inland_km);
+  candidates.clear();
+  water_shp.rtree()->query(bg::index::intersects(neighbourhood),
+                           std::back_inserter(candidates));
+  if (candidates.empty()) {
+    return nullptr;
+  }
+  const Box *nearest = &candidates[0].first;
+  double best = bg::comparable_distance(envelope, *nearest);
+  for (size_t i = 1; i < candidates.size(); ++i) {
+    const double d = bg::comparable_distance(envelope, candidates[i].first);
+    if (d < best) {
+      best = d;
+      nearest = &candidates[i].first;
+    }
+  }
+  return nearest;
+}
+
 auto select_overlap(const Shapefile &water_shp,
                     const Shapefile::PolygonList &area, double max_inland_km)
     -> SelectOverlapResult {
+  // -------------------------------------------------------------------
+  // Phase 1 (parallel): match each area polygon against the coast.
+  // -------------------------------------------------------------------
   auto pairs = std::vector<std::pair<size_t, Polygon>>();
-  auto orphans = std::vector<Polygon>();
+  auto matched_flags = std::vector<char>(area.size(), 0);
   auto mutex = std::mutex();
 
-  auto worker = [&water_shp, &area, &pairs, &orphans, &mutex, max_inland_km](
-                    const size_t i0, const size_t i1) {
+  auto worker = [&](const size_t i0, const size_t i1) {
     auto local = select_overlap_local(water_shp, area, i0, i1, max_inland_km);
-    if (local.matched.empty() && local.orphans.empty()) {
+    // matched_indices entries are unique to this chunk's [i0, i1) range,
+    // so we can write the flags lock-free (disjoint memory).
+    for (size_t ix : local.matched_indices) {
+      matched_flags[ix] = 1;
+    }
+    if (local.matched.empty()) {
       return;
     }
     std::lock_guard<std::mutex> lock(mutex);
     pairs.insert(pairs.end(), std::make_move_iterator(local.matched.begin()),
                  std::make_move_iterator(local.matched.end()));
-    orphans.insert(orphans.end(),
-                   std::make_move_iterator(local.orphans.begin()),
-                   std::make_move_iterator(local.orphans.end()));
   };
-  // num_threads = 0 → use std::thread::hardware_concurrency(); chunk size is
-  // chosen dynamically inside parallel_for to balance load across threads.
   parallel_for(worker, area.size(), 0);
 
   // Group matches by water polygon index. Each water index appears at most
-  // once in the result so the merge phase can mutate water polygons without
-  // synchronization. (A single area polygon clipped into multiple pieces all
-  // map to the same water_idx and end up in the same group.)
+  // once so merge_overlapping can mutate water polygons without locking.
   std::unordered_map<size_t, std::vector<Polygon>> grouped;
   grouped.reserve(pairs.size());
   for (auto &&p : pairs) {
@@ -264,11 +322,41 @@ auto select_overlap(const Shapefile &water_shp,
     std::cout << "#" << kv.first << " " << kv.second.size() << std::endl;
     result.matched.emplace_back(kv.first, std::move(kv.second));
   }
-  result.orphans = std::move(orphans);
-  if (!result.orphans.empty()) {
-    std::cout << "Orphans (no coast intersection, within " << max_inland_km
-              << " km of coast): " << result.orphans.size() << std::endl;
+
+  // -------------------------------------------------------------------
+  // Phase 2 (single-threaded): cascading orphan inclusion.
+  //
+  // Only runs when max_inland_km > 0. We identify "coastal" components
+  // of the area-polygon graph (intersection-linked), then include any
+  // non-matched polygon that lives in such a component. Each is clipped
+  // to within max_inland_km of the nearest coast polygon so a chain of
+  // river polygons reaching deep inland doesn't drag the result with
+  // it. Isolated inland lakes form their own (non-coastal) components
+  // and are excluded automatically.
+  // -------------------------------------------------------------------
+  if (max_inland_km > 0.0) {
+    const auto orphan_idx = compute_cascading_orphans(area, matched_flags);
+    size_t included = 0;
+    for (size_t ix : orphan_idx) {
+      const Polygon &area_polygon = *area[ix];
+      const Box *anchor =
+          nearest_coast_envelope(water_shp, area_polygon, max_inland_km);
+      if (anchor == nullptr) {
+        // The component is coastal but THIS polygon happens to be far
+        // from the open coast (e.g. far upstream in the network). Skip
+        // — clipping it would yield nothing anyway.
+        continue;
+      }
+      emit_clipped_orphan(area_polygon, *anchor, max_inland_km,
+                          result.orphans);
+      ++included;
+    }
+    if (included > 0) {
+      std::cout << "Cascading orphans (connected to coast, clipped to "
+                << max_inland_km << " km): " << included << std::endl;
+    }
   }
+
   return result;
 }
 
