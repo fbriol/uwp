@@ -742,9 +742,12 @@ def convert_to_shp(region: str, sub_region: str) -> None:
             'osmium',
             'tags-filter',
             str(osm_pbf),
-            'w', 'natural=water',
-            'r', 'natural=water,waterway',
-            'wr', 'waterway=riverbank',
+            'w',
+            'natural=water',
+            'r',
+            'natural=water,waterway',
+            'wr',
+            'waterway=riverbank',
             '-o',
             str(water_pbf),
             '--overwrite',
@@ -1166,9 +1169,11 @@ def _run_uwp(
         if region in selected_areas
         and shp_sub_region(region, sub_region).exists()
     ]
+    msg = (
+        'Running %s on %d regional shapefile(s) (max_inland_km=%g, patches=%s)'
+    )
     LOGGER.info(
-        'Running %s on %d regional shapefile(s) '
-        '(max_inland_km=%g, patches=%s)',
+        msg,
         uwp_path,
         len(water_shapefiles),
         max_inland_km,
