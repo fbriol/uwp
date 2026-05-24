@@ -372,18 +372,36 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   let timer = null;
   let inflight = null;
 
-  function fetchLayer(endpoint, layer, label) {{
+  // Compute the API base URL from the page's own pathname so the same
+  // HTML works both for direct localhost access AND behind a reverse
+  // proxy that mounts us under a sub-path (e.g. JupyterHub at
+  // /user/<name>/proxy/<port>/). Absolute URLs like `/api/patches`
+  // would bypass the proxy prefix and 404 on the host root.
+  function apiBase() {{
+    let p = window.location.pathname;
+    // If the path ends in a filename (e.g. /index.html), strip it.
+    const lastSlash = p.lastIndexOf('/');
+    if (lastSlash >= 0 && p.slice(lastSlash + 1).includes('.')) {{
+      p = p.slice(0, lastSlash + 1);
+    }}
+    // Make sure we end with a slash so concatenation works.
+    if (!p.endsWith('/')) p += '/';
+    return p;
+  }}
+
+  function fetchLayer(name, layer, label) {{
     const b = map.getBounds();
     const bbox = [
       b.getWest(), b.getSouth(), b.getEast(), b.getNorth()
     ].map(v => v.toFixed(5)).join(',');
-    const key = endpoint + ':' + bbox;
+    const key = name + ':' + bbox;
     if (key === lastBboxKey) return;  // viewport unchanged
     lastBboxKey = key;
     if (inflight) inflight.abort();
     inflight = new AbortController();
     status.textContent = `loading ${{label}}…`;
-    fetch(endpoint + '?bbox=' + bbox, {{ signal: inflight.signal }})
+    const url = apiBase() + 'api/' + name + '?bbox=' + bbox;
+    fetch(url, {{ signal: inflight.signal }})
       .then(r => r.json())
       .then(data => {{
         layer.clearLayers();
@@ -400,10 +418,10 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   function refreshAll() {{
     lastBboxKey = null;  // force re-fetch on every refresh
     if (document.getElementById('cb-patches').checked) {{
-      fetchLayer('/api/patches', patchesLayer, 'patches');
+      fetchLayer('patches', patchesLayer, 'patches');
     }}
     if (coastLayer && document.getElementById('cb-coastline').checked) {{
-      fetchLayer('/api/coastline', coastLayer, 'coastline');
+      fetchLayer('coastline', coastLayer, 'coastline');
     }}
   }}
 
