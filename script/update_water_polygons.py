@@ -742,10 +742,14 @@ def convert_to_shp(region: str, sub_region: str) -> None:
             'osmium',
             'tags-filter',
             str(osm_pbf),
-            'w', 'natural=water,shoal',
-            'r', 'natural=water,waterway,shoal',
-            'wr', 'waterway=riverbank',
-            '-o', str(water_pbf),
+            'w',
+            'natural=water,shoal',
+            'r',
+            'natural=water,waterway,shoal',
+            'wr',
+            'waterway=riverbank',
+            '-o',
+            str(water_pbf),
             '--overwrite',
         ],
         check=True,
@@ -933,6 +937,15 @@ def usage() -> argparse.Namespace:
         help='Skip writing the patches shapefile. The C++ binary then '
         'runs without tracking — saves a small amount of memory on huge '
         'datasets.',
+    )
+    parser.add_argument(
+        '--no-download',
+        action='store_true',
+        help='Skip the download / extraction phase entirely and run the '
+        'C++ coastline computation on the shapefiles already present in '
+        'the local cache. Useful when iterating on the merge algorithm: '
+        'no Geofabrik HEAD polls, no osmium / ogr2ogr work, no manifest '
+        'update — just the C++ pass.',
     )
     return parser.parse_args()
 
@@ -1140,6 +1153,25 @@ def _refresh_regions(
     )
 
 
+def _missing_area_shapefiles(selected_areas: tuple) -> list[str]:
+    """Return manifest keys (region[/sub]) whose `water.shp` is missing
+    from the local cache, plus the base water-polygons shapefile if it
+    has not been downloaded yet. Used by ``--no-download`` to validate
+    that the C++ binary will find every input it needs *before* it is
+    invoked, so the user sees a clear, upfront error rather than a
+    cryptic failure inside the binary.
+    """
+    missing: list[str] = []
+    if not water_polygon_path().exists():
+        missing.append(f'base coastline ({water_polygon_path()})')
+    for region, sub_region in AREAS.items():
+        if region not in selected_areas:
+            continue
+        if not shp_sub_region(region, sub_region).exists():
+            missing.append(_manifest_key(region, sub_region))
+    return missing
+
+
 def _run_uwp(
     uwp_path: str,
     selected_areas: tuple,
@@ -1211,32 +1243,51 @@ def main():
     _MAX_RETRIES = max(1, args.max_retries)
 
     manifest = load_manifest()
-    regions_to_process, pending_metadata = _plan_refresh(
-        args.areas,
-        manifest,
-        force=args.force,
-        min_cache_age_days=args.min_cache_age_days,
-    )
 
-    if args.check_only:
-        for region, sub_region in regions_to_process:
-            print(_manifest_key(region, sub_region))
-        return
-
-    try:
-        _refresh_regions(
-            regions_to_process,
-            manifest,
-            pending_metadata,
-            download_jobs=max(1, args.jobs),
-            extract_jobs=max(1, args.extract_jobs),
+    if args.no_download:
+        # Bypass all network / extraction work. We still validate that
+        # the per-region shapefiles the C++ binary will read are present,
+        # so the user gets a clear error here rather than a cryptic one
+        # from the binary later.
+        LOGGER.info(
+            '--no-download: skipping refresh + extraction, '
+            'running C++ binary on cached shapefiles',
         )
-        download_water_polygons(manifest, force=args.force)
-    finally:
-        # Persist whatever progress we made, even if a later step fails:
-        # the next run picks up where we left off without re-downloading
-        # the regions that already succeeded.
-        save_manifest(manifest)
+        missing = _missing_area_shapefiles(args.areas)
+        if missing:
+            LOGGER.error(
+                '--no-download requires every selected area to be already '
+                'cached. Missing: %s',
+                ', '.join(missing),
+            )
+            sys.exit(1)
+    else:
+        regions_to_process, pending_metadata = _plan_refresh(
+            args.areas,
+            manifest,
+            force=args.force,
+            min_cache_age_days=args.min_cache_age_days,
+        )
+
+        if args.check_only:
+            for region, sub_region in regions_to_process:
+                print(_manifest_key(region, sub_region))
+            return
+
+        try:
+            _refresh_regions(
+                regions_to_process,
+                manifest,
+                pending_metadata,
+                download_jobs=max(1, args.jobs),
+                extract_jobs=max(1, args.extract_jobs),
+            )
+            download_water_polygons(manifest, force=args.force)
+        finally:
+            # Persist whatever progress we made, even if a later step fails:
+            # the next run picks up where we left off without re-downloading
+            # the regions that already succeeded.
+            save_manifest(manifest)
 
     # Resolve the patches output path: user override > default > disabled.
     if args.no_patches:
