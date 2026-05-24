@@ -716,15 +716,35 @@ def convert_to_shp(region: str, sub_region: str) -> None:
             OSM_CONFIG_FILE,
         )
 
+    # OSM tagging for water bodies has evolved over time. We pick up:
+    #
+    #   w  natural=water           — most lakes / lagoons / bays / small
+    #                                rivers (single-way polygons).
+    #   r  natural=water           — *modern* multipolygon relations for
+    #                                large water bodies (estuaries with
+    #                                islands, river systems modelled as
+    #                                one big relation). This is the tag
+    #                                missing from older versions of this
+    #                                script — without it, the middle of a
+    #                                relation-modelled river vanishes
+    #                                from the patches.
+    #   r  natural=waterway        — legacy (pre-2014) tag, still found
+    #                                on older relations in low-edit
+    #                                regions. Kept for compatibility.
+    #   wr waterway=riverbank      — deprecated tag (replaced by
+    #                                `natural=water + water=river`) but
+    #                                still present in some PBFs.
+    #
+    # Selecting a relation automatically includes its member ways and
+    # their nodes, so the geometry is reconstructible by ogr2ogr.
     subprocess.run(
         [
             'osmium',
             'tags-filter',
             str(osm_pbf),
-            'w',
-            'natural=water',
-            'r',
-            'natural=waterway',
+            'w', 'natural=water',
+            'r', 'natural=water,waterway',
+            'wr', 'waterway=riverbank',
             '-o',
             str(water_pbf),
             '--overwrite',
@@ -1147,7 +1167,8 @@ def _run_uwp(
         and shp_sub_region(region, sub_region).exists()
     ]
     LOGGER.info(
-        'Running %s on %d regional shapefile(s) (max_inland_km=%g, patches=%s)',
+        'Running %s on %d regional shapefile(s) '
+        '(max_inland_km=%g, patches=%s)',
         uwp_path,
         len(water_shapefiles),
         max_inland_km,
