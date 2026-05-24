@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <unordered_map>
@@ -79,28 +80,6 @@ void emit_clipped_pieces(const Polygon &area_polygon, const Box &water_env,
   }
 }
 
-// Orphan-flavoured variant of `emit_clipped_pieces`: same clipping logic
-// (clip to anchor envelope + max_inland_km buffer) but no water_idx
-// pairing — orphans live as standalone polygons in the output.
-void emit_clipped_orphan(const Polygon &area_polygon, const Box &anchor_env,
-                         double max_inland_km, std::vector<Polygon> &out) {
-  if (max_inland_km <= 0.0) {
-    out.emplace_back(area_polygon);
-    return;
-  }
-  const Box cap = build_cap_box(anchor_env, max_inland_km);
-  const Box area_env = bg::return_envelope<Box>(area_polygon);
-  if (bg::covered_by(area_env, cap)) {
-    out.emplace_back(area_polygon);
-    return;
-  }
-  std::vector<Polygon> clipped;
-  bg::intersection(area_polygon, cap, clipped);
-  for (auto &&piece : clipped) {
-    out.emplace_back(std::move(piece));
-  }
-}
-
 // Union-Find with path compression and rank — used to identify
 // connected components of area polygons in the cascading orphan pass.
 class UnionFind {
@@ -167,8 +146,8 @@ auto compute_cascading_orphans(const Shapefile::PolygonList &area,
                      std::back_inserter(candidates));
     for (const auto &c : candidates) {
       const size_t j = c.second;
-      if (j <= i) continue;                     // pair handled once
-      if (uf.find(i) == uf.find(j)) continue;   // already linked
+      if (j <= i) continue;                    // pair handled once
+      if (uf.find(i) == uf.find(j)) continue;  // already linked
       if (bg::intersects(*area[i], *area[j])) {
         uf.unite(i, j);
       }
@@ -255,12 +234,20 @@ inline auto select_overlap_local(const Shapefile &water_shp,
   return out;
 }
 
-// Nearest coast polygon's envelope, looked up via the water R-tree.
-// Returns nullptr if no coast lies within `max_inland_km` of the area
-// polygon's envelope. Used as the clip anchor for orphan polygons.
-auto nearest_coast_envelope(const Shapefile &water_shp,
-                            const Polygon &area_polygon,
-                            double max_inland_km) -> const Box * {
+// Real geometric distance (in kilometres) from an area polygon to the
+// nearest coast polygon, computed via bg::distance on the actual ring
+// geometry — NOT envelope-to-envelope. Returns +inf if no coast polygon
+// lies within the search neighbourhood (envelope expanded by
+// `max_inland_km`), in which case the orphan is far inland and should
+// be dropped.
+//
+// Coordinates are Cartesian lon/lat degrees; we convert the degree
+// distance to kilometres using the latitude midpoint of the area
+// polygon's envelope (same approximation as build_cap_box, accurate to
+// a few % even at high latitudes which is plenty for the inland cap).
+auto distance_to_coast_km(const Shapefile &water_shp,
+                          const Polygon &area_polygon, double max_inland_km)
+    -> double {
   static thread_local std::vector<Shapefile::PolygonIndex> candidates;
   const Box envelope = bg::return_envelope<Box>(area_polygon);
   const Box neighbourhood = build_cap_box(envelope, max_inland_km);
@@ -268,18 +255,32 @@ auto nearest_coast_envelope(const Shapefile &water_shp,
   water_shp.rtree()->query(bg::index::intersects(neighbourhood),
                            std::back_inserter(candidates));
   if (candidates.empty()) {
-    return nullptr;
+    return std::numeric_limits<double>::infinity();
   }
-  const Box *nearest = &candidates[0].first;
-  double best = bg::comparable_distance(envelope, *nearest);
-  for (size_t i = 1; i < candidates.size(); ++i) {
-    const double d = bg::comparable_distance(envelope, candidates[i].first);
-    if (d < best) {
-      best = d;
-      nearest = &candidates[i].first;
+
+  const double lat_mid = 0.5 * (bg::get<bg::min_corner, 1>(envelope) +
+                                bg::get<bg::max_corner, 1>(envelope));
+  const double cos_lat = std::max(0.01, std::cos(lat_mid * M_PI / 180.0));
+  // 1 degree ≈ this many km along a great-circle bearing that mixes
+  // lat (111 km/°) and lon (111·cos(lat) km/°). The minimum is the
+  // conservative bound for an arbitrary direction.
+  const double km_per_deg = KM_PER_DEG_LAT * std::min(1.0, cos_lat);
+
+  const auto &water_polygons = *water_shp.polygons();
+  double best_km = std::numeric_limits<double>::infinity();
+  for (const auto &c : candidates) {
+    const auto &coast = *water_polygons[c.second];
+    // Cheap early-out: envelope distance lower-bounds true distance.
+    const double env_deg = bg::distance(envelope, c.first);
+    if (env_deg * km_per_deg >= best_km) continue;
+    const double d_deg = bg::distance(area_polygon, coast);
+    const double d_km = d_deg * km_per_deg;
+    if (d_km < best_km) {
+      best_km = d_km;
+      if (best_km == 0.0) break;
     }
   }
-  return nearest;
+  return best_km;
 }
 
 auto select_overlap(const Shapefile &water_shp,
@@ -319,7 +320,6 @@ auto select_overlap(const Shapefile &water_shp,
   auto result = SelectOverlapResult{};
   result.matched.reserve(grouped.size());
   for (auto &&kv : grouped) {
-    std::cout << "#" << kv.first << " " << kv.second.size() << std::endl;
     result.matched.emplace_back(kv.first, std::move(kv.second));
   }
 
@@ -328,32 +328,38 @@ auto select_overlap(const Shapefile &water_shp,
   //
   // Only runs when max_inland_km > 0. We identify "coastal" components
   // of the area-polygon graph (intersection-linked), then include any
-  // non-matched polygon that lives in such a component. Each is clipped
-  // to within max_inland_km of the nearest coast polygon so a chain of
-  // river polygons reaching deep inland doesn't drag the result with
-  // it. Isolated inland lakes form their own (non-coastal) components
-  // and are excluded automatically.
+  // non-matched polygon that lives in such a component AND whose real
+  // geometric distance (not envelope distance) to the nearest coast
+  // polygon is within max_inland_km. Two filters in series:
+  //
+  //   * cascading filter → kills inland lakes (no chain to coast);
+  //   * distance filter  → kills far-upstream river polygons (the
+  //                        chain exists but extends 100s of km inland).
+  //
+  // We deliberately do NOT clip the kept orphan: river channels are
+  // already short individual features and clipping would slice them
+  // mid-water at an arbitrary box edge. Either the whole feature is
+  // within max_inland_km of the coast or it's dropped.
   // -------------------------------------------------------------------
   if (max_inland_km > 0.0) {
     const auto orphan_idx = compute_cascading_orphans(area, matched_flags);
     size_t included = 0;
+    size_t dropped_far = 0;
     for (size_t ix : orphan_idx) {
       const Polygon &area_polygon = *area[ix];
-      const Box *anchor =
-          nearest_coast_envelope(water_shp, area_polygon, max_inland_km);
-      if (anchor == nullptr) {
-        // The component is coastal but THIS polygon happens to be far
-        // from the open coast (e.g. far upstream in the network). Skip
-        // — clipping it would yield nothing anyway.
+      const double d_km =
+          distance_to_coast_km(water_shp, area_polygon, max_inland_km);
+      if (d_km > max_inland_km) {
+        ++dropped_far;
         continue;
       }
-      emit_clipped_orphan(area_polygon, *anchor, max_inland_km,
-                          result.orphans);
+      result.orphans.emplace_back(area_polygon);
       ++included;
     }
-    if (included > 0) {
-      std::cout << "Cascading orphans (connected to coast, clipped to "
-                << max_inland_km << " km): " << included << std::endl;
+    if (included > 0 || dropped_far > 0) {
+      std::cout << "Cascading orphans: " << included << " kept (" << dropped_far
+                << " dropped, > " << max_inland_km << " km from coast)"
+                << std::endl;
     }
   }
 
