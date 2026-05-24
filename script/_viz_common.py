@@ -174,9 +174,12 @@ def select_cells(
     for ch in _GEOHASH_BASE32:
         bbox = geohash1_bbox(ch)
         if user_bbox is not None:
-            bbox = intersect_bboxes(bbox, user_bbox)
-            if bbox is None:
+            # New binding to keep mypy happy (intersect_bboxes returns
+            # an Optional, can't reassign to the non-Optional `bbox`).
+            clipped = intersect_bboxes(bbox, user_bbox)
+            if clipped is None:
                 continue
+            bbox = clipped
         cells.append((ch, bbox))
     return cells
 
@@ -252,59 +255,84 @@ def prefilter_by_area(
     return kept
 
 
-def assign_geohash(
-    pieces: gpd.GeoDataFrame, precision: int
-) -> gpd.GeoDataFrame:
-    """Add a `geohash` column to `pieces` by encoding each polygon's
-    centroid at the given precision.
+def cell_size(precision: int) -> tuple[float, float]:
+    """(lon_step, lat_step) in degrees for any geohash cell at `precision`.
 
-    The cell grid is deterministic (no proximity clustering), so the
-    number of produced cells is bounded above by `32 ** precision` and
-    the partition is reproducible across runs. Border polygons get
-    assigned to whichever cell contains their centroid — for QA viz
-    that's good enough.
+    All cells at the same precision have identical dimensions; we read
+    them off a sample cell to avoid hard-coding the lon/lat-bit ratios
+    (which alternate with precision parity).
+    """
+    sample = encode_geohash(0.0, 0.0, precision)
+    bb = geohash_bbox(sample)
+    return (bb[2] - bb[0], bb[3] - bb[1])
+
+
+def enumerate_geohashes_in_bbox(
+    bbox: tuple[float, float, float, float], precision: int
+) -> list[str]:
+    """All geohashes at `precision` whose cell intersects `bbox`.
+
+    Returns the list in row-major (top-to-bottom, west-to-east) order so
+    it can be consumed directly by the planisphere HTML grid.
+    """
+    minlon, minlat, maxlon, maxlat = bbox
+    lon_step, lat_step = cell_size(precision)
+
+    # Snap bbox to the cell grid. The world origin is (-180, -90); cells
+    # tile from there outward.
+    col_min = math.floor((minlon - (-180.0)) / lon_step)
+    col_max = math.floor((maxlon - (-180.0)) / lon_step)
+    if (maxlon - (-180.0)) / lon_step == col_max and maxlon > minlon:
+        col_max -= 1  # don't include a cell that the bbox only touches
+    row_min = math.floor((minlat - (-90.0)) / lat_step)
+    row_max = math.floor((maxlat - (-90.0)) / lat_step)
+    if (maxlat - (-90.0)) / lat_step == row_max and maxlat > minlat:
+        row_max -= 1
+
+    # Row-major output goes north-to-south, west-to-east — matches the way
+    # we lay out the planisphere HTML grid.
+    geohashes: list[str] = []
+    for row in range(row_max, row_min - 1, -1):
+        lat_centre = -90.0 + (row + 0.5) * lat_step
+        for col in range(col_min, col_max + 1):
+            lon_centre = -180.0 + (col + 0.5) * lon_step
+            geohashes.append(encode_geohash(lon_centre, lat_centre, precision))
+    return geohashes
+
+
+def geohash_grid_position(
+    geohash: str, lon_step: float, lat_step: float
+) -> tuple[int, int]:
+    """(col, row) of `geohash` in the planisphere grid.
+
+    Col 0 is the westmost cell (minlon = -180). Row 0 is the *northmost*
+    cell (matches screen / CSS-grid orientation, top-to-bottom).
+    """
+    bb = geohash_bbox(geohash)
+    col = round((bb[0] - (-180.0)) / lon_step)
+    # row 0 = topmost = highest lat. The cell with maxlat = +90 is row 0,
+    # so the cell with maxlat = bb[3] is at row (90 - bb[3]) / lat_step.
+    row = round((90.0 - bb[3]) / lat_step)
+    return col, row
+
+
+def select_intersecting(
+    pieces: gpd.GeoDataFrame, bbox: tuple[float, float, float, float]
+) -> gpd.GeoDataFrame:
+    """Return the subset of `pieces` whose geometry intersects `bbox`.
+
+    Uses geopandas' coordinate indexer (which itself uses the underlying
+    R-tree). Replaces the old centroid-based assignment: a polygon
+    straddling a cell boundary now appears in BOTH cells, which is what
+    the planisphere visualisation wants.
     """
     if pieces.empty:
-        out = pieces.copy()
-        out['geohash'] = []
-        return out
-    with suppress_geographic_crs_warning():
-        cent_x = pieces.geometry.centroid.x.values
-        cent_y = pieces.geometry.centroid.y.values
-    geohashes = [
-        encode_geohash(float(lon), float(lat), precision)
-        for lon, lat in zip(cent_x, cent_y, strict=True)
-    ]
-    out = pieces.copy()
-    out['geohash'] = geohashes
-    return out
-
-
-def group_by_geohash(
-    pieces: gpd.GeoDataFrame, min_cell_km2: float
-) -> list[tuple[str, float, gpd.GeoDataFrame]]:
-    """Group polygons by their `geohash` column and return cells sorted by
-    total area descending. Cells whose summed added area is below
-    `min_cell_km2` are dropped.
-
-    Returns a list of `(geohash, area_km2, pieces_in_cell)`.
-    """
-    if pieces.empty or 'geohash' not in pieces.columns:
-        return []
-    cells: list[tuple[str, float, gpd.GeoDataFrame]] = []
-    for gh, sub in pieces.groupby('geohash', sort=False):
-        if sub.empty:
-            continue
-        # Bbox center latitude is a good-enough reference for the local
-        # cos(lat) area correction — the cell is small.
-        bbox = geohash_bbox(gh)
-        lat_mid = (bbox[1] + bbox[3]) / 2
-        total = area_km2(unary_union(sub.geometry.values), lat_mid)
-        if total < min_cell_km2:
-            continue
-        cells.append((gh, total, sub))
-    cells.sort(key=lambda x: -x[1])
-    return cells
+        return pieces
+    minlon, minlat, maxlon, maxlat = bbox
+    # geopandas' CoordinateIndexer accepts float slices, but its type
+    # stubs only declare int/SupportsIndex — silence the mypy false
+    # positive (runtime behaviour is correct).
+    return pieces.cx[minlon:maxlon, minlat:maxlat]  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
@@ -389,45 +417,37 @@ def render_geohash_cell(
     dpi: int,
     with_basemap: bool,
     basemap_provider: str = _DEFAULT_BASEMAP_PROVIDER,
-    reference: gpd.GeoDataFrame | None = None,
-    revised: gpd.GeoDataFrame | None = None,
+    coastline: gpd.GeoDataFrame | None = None,
 ) -> dict:
-    """Render every polygon in a geohash cell, each in a distinct colour.
+    """Render the polygons intersecting a geohash cell, each in a
+    distinct colour.
 
-    The extent of the figure is the geohash cell itself (not the pieces'
-    bbox) so adjacent cells line up perfectly in the atlas and the user
-    can mentally tile them. A thin grey outline around the cell bbox
-    makes the boundary explicit.
+    The figure extent is the geohash cell itself; matplotlib clips
+    outside, so polygons that extend past the cell border display as
+    truncated. Adjacent cells line up perfectly in the planisphere
+    atlas.
 
-    Optional `reference` / `revised` layers (used by visualize_diff) are
-    clipped to the cell extent and drawn as boundary outlines (blue /
-    red) underneath the coloured patches.
-
-    Returns the metadata record for the atlas index.
+    `coastline` (optional, used by visualize_diff) is drawn as a thin
+    dark outline UNDERNEATH the coloured polygons so the user sees
+    where each addition lands relative to the modified coast.
     """
     minlon, minlat, maxlon, maxlat = geohash_bbox(geohash)
-    # No padding — the extent IS the cell. Atlas tiles align then.
-    ref_local = None
-    rev_local = None
-    if reference is not None:
-        ref_local = reference.cx[minlon:maxlon, minlat:maxlat]
-    if revised is not None:
-        rev_local = revised.cx[minlon:maxlon, minlat:maxlat]
+    coast_local = None
+    if coastline is not None:
+        # Same float-slice / stub limitation as in `select_intersecting`.
+        coast_local = select_intersecting(
+            coastline, (minlon, minlat, maxlon, maxlat)
+        )
 
     fig, ax = plt.subplots(figsize=(10, 10), dpi=dpi)
     colors = _polygon_colors(len(pieces))
 
     if with_basemap and _HAVE_CONTEXTILY:
-        pieces_3857 = pieces.to_crs(3857)
-        if ref_local is not None and not ref_local.empty:
-            ref_local.to_crs(3857).boundary.plot(
-                ax=ax, edgecolor='#1f77b4', linewidth=0.5, alpha=0.7
+        if coast_local is not None and not coast_local.empty:
+            coast_local.to_crs(3857).boundary.plot(
+                ax=ax, edgecolor='#444', linewidth=0.6, alpha=0.9
             )
-        if rev_local is not None and not rev_local.empty:
-            rev_local.to_crs(3857).boundary.plot(
-                ax=ax, edgecolor='#d62728', linewidth=0.7, alpha=0.85
-            )
-        pieces_3857.plot(
+        pieces.to_crs(3857).plot(
             ax=ax,
             color=colors,
             edgecolor='black',
@@ -443,21 +463,13 @@ def render_geohash_cell(
             ax, extent_3857, basemap_provider, f'cell {geohash}'
         )
     else:
-        if ref_local is not None and not ref_local.empty:
-            ref_local.boundary.plot(
+        if coast_local is not None and not coast_local.empty:
+            coast_local.boundary.plot(
                 ax=ax,
-                edgecolor='#1f77b4',
-                linewidth=0.5,
-                label='reference',
-                alpha=0.7,
-            )
-        if rev_local is not None and not rev_local.empty:
-            rev_local.boundary.plot(
-                ax=ax,
-                edgecolor='#d62728',
-                linewidth=0.7,
-                label='revised',
-                alpha=0.85,
+                edgecolor='#444',
+                linewidth=0.6,
+                alpha=0.9,
+                label='coastline (revised)',
             )
         pieces.plot(
             ax=ax,
@@ -469,9 +481,7 @@ def render_geohash_cell(
         ax.set_xlim(minlon, maxlon)
         ax.set_ylim(minlat, maxlat)
         ax.set_aspect('equal')
-        if (ref_local is not None and not ref_local.empty) or (
-            rev_local is not None and not rev_local.empty
-        ):
+        if coast_local is not None and not coast_local.empty:
             ax.legend(loc='best', framealpha=0.85)
         ax.set_xlabel('Longitude')
         ax.set_ylabel('Latitude')
@@ -516,59 +526,185 @@ _HTML_TEMPLATE = """<!doctype html>
 <meta charset="utf-8">
 <title>UWP atlas</title>
 <style>
-  body  {{ font-family: system-ui, sans-serif; margin: 2rem; }}
-  table {{ border-collapse: collapse; width: 100%; }}
-  th, td {{ border: 1px solid #ddd; padding: 6px 8px; text-align: left; }}
-  th {{ background: #f4f4f4; }}
-  tr:nth-child(even) {{ background: #fafafa; }}
-  img {{ max-height: 60px; }}
-  a {{ color: #0645ad; text-decoration: none; }}
-  a:hover {{ text-decoration: underline; }}
+  body {{
+    font-family: system-ui, sans-serif;
+    margin: 1.5rem;
+    background: #fafafa;
+  }}
+  h1 {{ margin-bottom: 0.25rem; }}
+  p.summary {{ color: #555; margin-top: 0; }}
+  .planisphere {{
+    display: grid;
+    grid-template-columns: repeat({cols}, {tile}px);
+    gap: 1px;
+    background: #ddd;
+    border: 1px solid #aaa;
+    width: max-content;
+    margin: 1rem auto;
+  }}
+  .cell {{
+    width: {tile}px;
+    height: {tile}px;
+    background: #fff;
+    position: relative;
+    overflow: hidden;
+  }}
+  .cell.empty {{
+    background: #f0f0f0;
+    background-image:
+      linear-gradient(45deg, #e6e6e6 25%, transparent 25%),
+      linear-gradient(-45deg, #e6e6e6 25%, transparent 25%);
+    background-size: 8px 8px;
+  }}
+  .cell a {{ display: block; width: 100%; height: 100%; }}
+  .cell img {{
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }}
+  .cell .label {{
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: rgba(0, 0, 0, 0.55);
+    color: white;
+    font-size: 9px;
+    text-align: center;
+    padding: 1px 2px;
+    font-family: monospace;
+  }}
 </style>
 </head>
 <body>
 <h1>UWP atlas</h1>
-<p>{summary}</p>
-<table id="atlas">
-<thead><tr>
-  <th>Geohash</th><th>Preview</th><th>Center</th>
-  <th>Added (km²)</th><th>Polygons</th>
-</tr></thead>
-<tbody>
-{rows}
-</tbody>
-</table>
+<p class="summary">{summary}</p>
+<p style="text-align:center; color:#555;">
+  Planisphere — geohash precision {precision}, grid {cols}x{rows}.
+  Click any tile to enlarge. Striped cells = no modifications.
+</p>
+<div class="planisphere">
+{tiles}
+</div>
 </body>
 </html>
 """
 
 
+def _planisphere_bounds(
+    rendered: list[dict],
+    enumerated_geohashes: list[str],
+    lon_step: float,
+    lat_step: float,
+) -> tuple[int, int, int, int]:
+    """(col_min, col_max, row_min, row_max) over all cells we know about
+    (both rendered and empty). The grid is built within that span."""
+    if not enumerated_geohashes:
+        return (0, 0, 0, 0)
+    cols, rows = [], []
+    for gh in enumerated_geohashes:
+        c, r = geohash_grid_position(gh, lon_step, lat_step)
+        cols.append(c)
+        rows.append(r)
+    return (min(cols), max(cols), min(rows), max(rows))
+
+
 def write_atlas(
-    output_dir: pathlib.Path, records: list[dict], summary: str
+    output_dir: pathlib.Path,
+    records: list[dict],
+    enumerated_geohashes: list[str],
+    precision: int,
+    summary: str,
+    tile_px: int = 96,
 ) -> None:
-    records_sorted = sorted(records, key=lambda r: -r['added_km2'])
+    """Write `index.html` (planisphere grid) + `cells.csv` (machine-
+    readable list of rendered cells).
+
+    `enumerated_geohashes` is the full list of cells the atlas covers
+    (in row-major order). Records whose geohash isn't in that list are
+    ignored (shouldn't happen in practice).
+    """
+
+    # CSV — sorted by area for human consumption. `list.sort` is used
+    # instead of `sorted` because pandas-stubs overrides `sorted`'s
+    # signature with pandas-specific overloads that interfere with our
+    # plain dict records here.
+    def _neg_area(rec: dict) -> float:
+        return -float(rec['added_km2'])
+
+    sorted_records = list(records)
+    sorted_records.sort(key=_neg_area)
 
     csv_path = output_dir / 'cells.csv'
-    pd.DataFrame(records_sorted).to_csv(csv_path, index=False)
+    pd.DataFrame(sorted_records).to_csv(csv_path, index=False)
     LOGGER.info('Wrote %s', csv_path)
 
-    rows_html = [
-        '<tr>'
-        f'<td><code>{html.escape(rec["geohash"])}</code></td>'
-        f'<td><a href="png/{html.escape(rec["image"])}">'
-        f'<img src="png/{html.escape(rec["image"])}" loading="lazy">'
-        '</a></td>'
-        f'<td>{rec["center_lat"]:+.4f}, {rec["center_lon"]:+.4f}</td>'
-        f'<td>{rec["added_km2"]:.3f}</td>'
-        f'<td>{rec["num_pieces"]}</td>'
-        '</tr>'
-        for rec in records_sorted
+    # Planisphere layout: lay out every enumerated cell on the grid,
+    # whether or not it has a rendered image.
+    lon_step, lat_step = cell_size(precision)
+    col_min, col_max, row_min, row_max = _planisphere_bounds(
+        records, enumerated_geohashes, lon_step, lat_step
+    )
+    n_cols = col_max - col_min + 1
+    n_rows = row_max - row_min + 1
+
+    by_geohash: dict[str, dict] = {r['geohash']: r for r in records}
+    # Place cells in row-major (top-to-bottom, west-to-east) order.
+    # CSS grid fills cells in declaration order along rows.
+    tiles_by_pos: dict[tuple[int, int], str] = {}
+    for gh in enumerated_geohashes:
+        col, row = geohash_grid_position(gh, lon_step, lat_step)
+        local_col = col - col_min
+        local_row = row - row_min
+        rec = by_geohash.get(gh)
+        if rec is not None:
+            img = html.escape(f'png/{rec["image"]}')
+            title = (
+                f'{gh}: {rec["added_km2"]:.2f} km² '
+                f'({rec["num_pieces"]} polygons)'
+            )
+            tile = (
+                f'<div class="cell" title="{html.escape(title)}">'
+                f'<a href="{img}"><img src="{img}" loading="lazy" '
+                f'alt="{html.escape(gh)}"></a>'
+                f'<div class="label">{html.escape(gh)}</div>'
+                '</div>'
+            )
+        else:
+            tile = (
+                f'<div class="cell empty" '
+                f'title="{html.escape(gh)} — no modifications"></div>'
+            )
+        tiles_by_pos[(local_row, local_col)] = tile
+
+    # Emit tiles in row-major order; missing positions get a placeholder
+    # (shouldn't happen if enumerate_geohashes_in_bbox covers the bbox).
+    parts: list[str] = [
+        tiles_by_pos.get((row, col), '<div class="cell empty"></div>')
+        for row in range(n_rows)
+        for col in range(n_cols)
     ]
     html_path = output_dir / 'index.html'
     html_path.write_text(
-        _HTML_TEMPLATE.format(summary=summary, rows='\n'.join(rows_html))
+        _HTML_TEMPLATE.format(
+            summary=summary,
+            cols=n_cols,
+            rows=n_rows,
+            tile=tile_px,
+            precision=precision,
+            tiles='\n'.join(parts),
+        )
     )
-    LOGGER.info('Wrote %s', html_path)
+    LOGGER.info(
+        'Wrote %s (planisphere grid %d cols x %d rows, %d rendered, '
+        '%d placeholders)',
+        html_path,
+        n_cols,
+        n_rows,
+        len(by_geohash),
+        len(enumerated_geohashes) - len(by_geohash),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -80,20 +80,36 @@ def _process_cell(
     if patches.empty:
         return []
 
-    patches = common.assign_geohash(patches, geohash_precision)
-    cells = common.group_by_geohash(patches, min_cell_km2)
-    if max_images and len(cells) > max_images:
-        cells = cells[:max_images]
+    # Enumerate every geohash cell that intersects this shard and render
+    # the polygons inside each. With intersection-based selection (rather
+    # than centroid grouping), a polygon straddling a cell border appears
+    # in BOTH cells — which is what the planisphere visualisation wants.
+    sub_geohashes = common.enumerate_geohashes_in_bbox(
+        shard_bbox, geohash_precision
+    )
 
     rendered: list[dict] = []
     png_dir = output_dir / 'png'
-    for geohash, _area, pieces_in_cell in cells:
-        name = f'gh_{geohash}.png'
+    for geohash in sub_geohashes:
+        bbox = common.geohash_bbox(geohash)
+        in_cell = common.select_intersecting(patches, bbox)
+        if in_cell.empty:
+            continue
+        # Per-cell area threshold — drop cells with only tiny adds.
+        with common.suppress_geographic_crs_warning():
+            lat_mid = (bbox[1] + bbox[3]) / 2
+        total = common.area_km2(
+            common.unary_union(in_cell.geometry.values), lat_mid
+        )
+        if total < min_cell_km2:
+            continue
+        if max_images and len(rendered) >= max_images:
+            break
         try:
             rec = common.render_geohash_cell(
                 geohash,
-                pieces_in_cell,
-                png_dir / name,
+                in_cell,
+                png_dir / f'gh_{geohash}.png',
                 dpi=dpi,
                 with_basemap=with_basemap,
                 basemap_provider=basemap_provider,
@@ -194,13 +210,26 @@ def main() -> None:
         )
         return
 
+    # Enumerate every cell in the user's bbox (or the global bbox) so the
+    # planisphere grid has placeholders for cells with no modifications.
+    full_bbox = tuple(user_bbox) if user_bbox else (-180.0, -90.0, 180.0, 90.0)
+    enumerated = common.enumerate_geohashes_in_bbox(
+        full_bbox, args.geohash_precision
+    )
+
     total_km2 = sum(r['added_km2'] for r in records)
     summary = (
         f'{len(records)} geohash-{args.geohash_precision} cell(s) rendered '
         f'(total added: {total_km2:.2f} km²) '
         f'from <code>{args.patches}</code>.'
     )
-    common.write_atlas(args.output, records, summary)
+    common.write_atlas(
+        args.output,
+        records,
+        enumerated,
+        args.geohash_precision,
+        summary,
+    )
     LOGGER.info('Done. %d image(s) written to %s', len(records), args.output)
 
 

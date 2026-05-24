@@ -188,27 +188,41 @@ def _process_cell(
     if deltas.empty:
         return []
 
-    deltas = common.assign_geohash(deltas, geohash_precision)
-    cells = common.group_by_geohash(deltas, min_cell_km2)
-    if max_images and len(cells) > max_images:
-        cells = cells[:max_images]
+    # Enumerate every geohash cell intersecting this shard and render
+    # the delta polygons inside each. Intersection-based selection keeps
+    # cross-boundary polygons visible in all cells they touch.
+    sub_geohashes = common.enumerate_geohashes_in_bbox(
+        shard_bbox, geohash_precision
+    )
 
     rendered: list[dict] = []
     png_dir = output_dir / 'png'
-    for geohash, _area, pieces_in_cell in cells:
-        name = f'gh_{geohash}.png'
+    for geohash in sub_geohashes:
+        bbox = common.geohash_bbox(geohash)
+        in_cell = common.select_intersecting(deltas, bbox)
+        if in_cell.empty:
+            continue
+        with common.suppress_geographic_crs_warning():
+            lat_mid = (bbox[1] + bbox[3]) / 2
+        total = common.area_km2(
+            common.unary_union(in_cell.geometry.values), lat_mid
+        )
+        if total < min_cell_km2:
+            continue
+        if max_images and len(rendered) >= max_images:
+            break
         try:
             rec = common.render_geohash_cell(
                 geohash,
-                pieces_in_cell,
-                png_dir / name,
+                in_cell,
+                png_dir / f'gh_{geohash}.png',
                 dpi=dpi,
                 with_basemap=with_basemap,
                 basemap_provider=basemap_provider,
-                # Diff-specific: layer reference (blue) and revised (red)
-                # outlines underneath the coloured delta polygons.
-                reference=reference,
-                revised=revised,
+                # Diff-specific: lay the *revised* coastline underneath
+                # the coloured patches so the user sees where each
+                # addition lands relative to the new coast.
+                coastline=revised,
             )
             rendered.append(rec)
         except Exception:
@@ -314,6 +328,11 @@ def main() -> None:
         )
         return
 
+    full_bbox = tuple(user_bbox) if user_bbox else (-180.0, -90.0, 180.0, 90.0)
+    enumerated = common.enumerate_geohashes_in_bbox(
+        full_bbox, args.geohash_precision
+    )
+
     total_km2 = sum(r['added_km2'] for r in records)
     summary = (
         f'{len(records)} geohash-{args.geohash_precision} cell(s) rendered '
@@ -321,7 +340,13 @@ def main() -> None:
         f'Source: <code>{args.revised}</code> vs '
         f'<code>{args.reference}</code>.'
     )
-    common.write_atlas(args.output, records, summary)
+    common.write_atlas(
+        args.output,
+        records,
+        enumerated,
+        args.geohash_precision,
+        summary,
+    )
     LOGGER.info('Done. %d image(s) written to %s', len(records), args.output)
 
 
