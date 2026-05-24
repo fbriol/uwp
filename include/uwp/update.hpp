@@ -13,15 +13,15 @@ auto cascade_union(const std::vector<Polygon> &polygons)
 
 /// @brief Result of `select_overlap`: matched + orphan area polygons.
 struct SelectOverlapResult {
-    /// `(water_index, area_polygons)` pairs to be merged into the water
-    /// polygons by `merge_overlapping`. Each water index appears at
-    /// most once.
-    std::vector<std::pair<size_t, std::vector<Polygon>>> matched;
-    /// Standalone area polygons that don't intersect any coast polygon
-    /// but are close enough (per `max_inland_km`) to be included as
-    /// new patches alongside the coastline. Added as-is, no union.
-    /// Empty when `max_inland_km <= 0`.
-    std::vector<Polygon> orphans;
+  /// `(water_index, area_polygons)` pairs to be merged into the water
+  /// polygons by `merge_overlapping`. Each water index appears at
+  /// most once.
+  std::vector<std::pair<size_t, std::vector<Polygon>>> matched;
+  /// Standalone area polygons that don't intersect any coast polygon
+  /// but are close enough (per `max_inland_km`) to be included as
+  /// new patches alongside the coastline. Added as-is, no union.
+  /// Empty when `max_inland_km <= 0`.
+  std::vector<Polygon> orphans;
 };
 
 /// @brief Selects the area polygons that overlap or are close to the
@@ -52,8 +52,7 @@ struct SelectOverlapResult {
 ///   0 disables both behaviours (no clipping, no orphan inclusion).
 auto select_overlap(const Shapefile &water_shp,
                     const Shapefile::PolygonList &area,
-                    double max_inland_km = 0.0)
-    -> SelectOverlapResult;
+                    double max_inland_km = 0.0) -> SelectOverlapResult;
 
 /// @brief Merge the selected area polygons into the matching water polygons.
 ///
