@@ -503,17 +503,23 @@ def render_geohash_cell(
     union_geom = unary_union(pieces.geometry.values)
     total_km2 = area_km2(union_geom, center_lat)
 
-    fig.suptitle(
+    # `ax.set_title` instead of `fig.suptitle`: the suptitle is anchored
+    # to the figure (always leaves a large gap when the axis is shrunk
+    # by set_aspect('equal')), whereas a per-axis title sits flush
+    # above the plot area regardless of how matplotlib resized it.
+    ax.set_title(
         f'Geohash {geohash} — '
         f'{center_lat:+.4f}°, {center_lon:+.4f}° '
         f'— added: {total_km2:.3f} km² '
         f'({len(pieces)} polygon'
         f'{"s" if len(pieces) > 1 else ""})',
         fontsize=12,
+        pad=6,
     )
-    fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, bbox_inches='tight')
+    # Tight crop on save: bbox_inches='tight' removes leftover figure
+    # margins, pad_inches keeps a small breathing room around the axis.
+    fig.savefig(output_path, bbox_inches='tight', pad_inches=0.1)
     plt.close(fig)
 
     return {
